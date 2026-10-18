@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Local research inputs and generated experiment artifacts
+data/
+artifacts/
+.env.*
+!.env.example
