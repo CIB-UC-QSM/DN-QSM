@@ -62,8 +62,9 @@ class CorrectiveObjectiveTests(unittest.TestCase):
 
     def test_local_loss_coefficient_is_fifty_percent_higher(self):
         weights = LossWeights()
+        self.assertFalse(hasattr(weights, "forward"))
         self.assertEqual(weights.local, 1.5)
-        for name in ("forward", "physics", "chi", "extension"):
+        for name in ("physics", "chi", "extension"):
             self.assertEqual(getattr(weights, name), 1.0)
             self.assertEqual(weights.local, 1.5 * getattr(weights, name))
         root = Path(__file__).resolve().parents[1]
@@ -73,8 +74,12 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             for name in ("corrective_200epochs.json", "corrective_ablation.json")
         )
         for config in configs:
+            self.assertFalse(hasattr(config, "lambda_forward"))
             for name, weight in vars(weights).items():
-                self.assertEqual(getattr(config, "lambda_" + name), weight)
+                self.assertEqual(
+                    getattr(config, "lambda_" + name),
+                    0.0 if name == "extension" else weight,
+                )
             self.assertEqual(getattr(config, "physics_warmup_epochs", 0), 0)
             self.assertEqual(getattr(config, "physics_warmup_steps", 0), 0)
         prediction, chi, local, full, mask, dipole = self.example()
@@ -169,7 +174,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
 
     def test_tkd_uses_full_grid_field_and_legacy_loading_preserves_mask(self):
         _, chi, _, full, mask, dipole = self.example(1)
-        model = DNQSM(ModelConfig((2, 4), full_grid_field=True))
+        model = DNQSM(ModelConfig((2, 4), full_grid_field=True, filter_input_version=1))
         with torch.no_grad():
             model.filter.final.weight.zero_()
             model.filter.final.bias.fill_(1)
@@ -313,10 +318,40 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             parsed = parse_args(["--config", str(profile), "--epochs", "4"])
             self.assertEqual((parsed.epochs, parsed.features), (4, (2, 4)))
 
+    def test_version_three_config_reaches_resume_guard_and_weights_remain_loadable(
+        self,
+    ):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = DNQSM(ModelConfig((2, 4)))
+            config = asdict(TrainConfig(device="cpu", features=(2, 4)))
+            config["lambda_forward"] = 1.0
+            checkpoint = root / "old_objective.pt"
+            torch.save(
+                dict(
+                    version=1,
+                    loss_version=3,
+                    config=config,
+                    model_config=asdict(model.config),
+                    model=model.state_dict(),
+                ),
+                checkpoint,
+            )
+            resumed = parse_args(["--resume", str(checkpoint)])
+            self.assertFalse(hasattr(resumed, "lambda_forward"))
+            with self.assertRaisesRegex(ValueError, "older loss.*--init-checkpoint"):
+                run_training(resumed)
+            loaded = load_trained_model(checkpoint)
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(
+                    loaded.state_dict()[name], value, rtol=0, atol=0
+                )
+
     def test_matched_and_stress_validation_logging_and_selection(self):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             root = Path(temporary)
             config = TrainConfig(
+                filter_pretrain_epochs=0,
                 data_dir=str(make_dataset(root)),
                 cache_dir=str(root / "cache"),
                 run_dir=str(root / "run"),
@@ -360,6 +395,12 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             self.assertEqual(best["best"], min(r["chi_nrmse"] for r in primary))
             updates = [r for r in rows if r["event"] == "train"]
             self.assertIn("raw_physics", updates[0])
+            self.assertTrue(
+                all(
+                    not any("forward" in name for name in row)
+                    for row in updates + primary + stress
+                )
+            )
             self.assertIn("chi_nrmse", updates[0])
             self.assertIn("grad_filter_physics", updates[0])
             self.assertLess(
@@ -409,6 +450,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             root = Path(temporary)
             config = TrainConfig(
+                filter_pretrain_epochs=0,
                 data_dir=str(make_dataset(root)),
                 cache_dir=str(root / "cache"),
                 run_dir=str(root / "run"),

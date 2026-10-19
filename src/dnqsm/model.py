@@ -18,10 +18,21 @@ class ModelConfig:
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = False
     residual_filter: bool = False
-    full_grid_field: bool = True
+    full_grid_field: bool = False
     laplacian_input: bool = True
+    filter_input_version: int = 2
 
     def __post_init__(self) -> None:
+        if self.filter_input_version not in (1, 2):
+            raise ValueError("Unsupported filter input version")
+        if self.filter_input_version == 2 and (
+            not self.laplacian_input or self.residual_filter or self.full_grid_field
+        ):
+            raise ValueError(
+                "Laplacian-only filtering requires laplacian_input=True, "
+                "residual_filter=False, and full_grid_field=False; "
+                "filter_input_version=1 selects the historical architecture"
+            )
         if not self.features or any(v < 1 for v in self.features):
             raise ValueError("U-Net features must be positive")
         if (
@@ -148,13 +159,14 @@ class DNQSM(nn.Module):
         self.filter = UNet3D(
             self.config.features,
             self.config.checkpoint_blocks,
-            in_channels=2 if self.config.laplacian_input else 1,
+            in_channels=2
+            if self.config.filter_input_version == 1 and self.config.laplacian_input
+            else 1,
         )
         self.null_network = UNet3D(self.config.features, self.config.checkpoint_blocks)
 
-    def forward(
-        self, total_field: Tensor, mask: Tensor, dipole: Tensor
-    ) -> Reconstruction:
+    def predict_local_field(self, total_field: Tensor, mask: Tensor) -> Tensor:
+        """Predict the clean field, masking both sides of the learned filter."""
         validate_mask(mask, total_field)
         field = total_field.float() * mask
         scale = masked_rms(field, mask, self.config.scale_floor)
@@ -162,11 +174,21 @@ class DNQSM(nn.Module):
         filter_input = normalized
         if self.laplacian_kernel is not None:
             laplacian = F.conv3d(normalized, self.laplacian_kernel, padding=1)
-            filter_input = torch.cat((normalized, laplacian), dim=1)
+            filter_input = (
+                torch.cat((normalized, laplacian), dim=1)
+                if self.config.filter_input_version == 1
+                else laplacian
+            )
         filtered = self.filter(filter_input).float() * scale
         local = field + filtered if self.config.residual_filter else filtered
         if not self.config.full_grid_field:
             local = local * mask
+        return local
+
+    def forward(
+        self, total_field: Tensor, mask: Tensor, dipole: Tensor
+    ) -> Reconstruction:
+        local = self.predict_local_field(total_field, mask)
         inverse, projection = cutoff_kernels(dipole, self.config.threshold)
         initial = apply_multiplier(local, inverse)
         chi_scale = masked_rms(initial, mask, self.config.scale_floor)

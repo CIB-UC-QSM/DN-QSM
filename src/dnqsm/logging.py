@@ -84,6 +84,25 @@ def nrmse_label(
     return "NRMSE=N/A" if value is None else f"NRMSE={value:.2f}%"
 
 
+def filtering_figure(batch: dict, local_field: torch.Tensor, title: str):
+    """Field-only comparison for independent filter training."""
+    mask = batch["mask"][:1]
+    target, predicted = batch["local"][:1], local_field[:1]
+    return comparison_figure(
+        [
+            ("Total field (ppm)", batch["phase"][:1] * mask, False),
+            ("Clean local field (ppm)", target * mask, False),
+            (
+                "Filtered local, " + nrmse_label(predicted, target, mask),
+                predicted,
+                False,
+            ),
+            ("Local error (ppm)", (predicted - target) * mask, False),
+        ],
+        title,
+    )
+
+
 def reconstruction_figure(batch: dict, prediction, title: str):
     """Select the first sample only, without retaining training graphs."""
     mask = batch["mask"][:1]

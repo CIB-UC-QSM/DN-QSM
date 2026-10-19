@@ -270,7 +270,7 @@ def main(argv=None):
         parser.error("Target fraction must be between zero and one")
     config = TrainConfig(
         features=(23, 47, 90),
-        residual_filter=True,
+        residual_filter=False,
         accumulation_steps=1,
         crop_probability=0.2,
     )

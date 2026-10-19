@@ -43,9 +43,10 @@ class OverfitConfig:
     features: tuple[int, ...] = (54, 108, 216, 432, 864)
     threshold: float = 0.1
     checkpoint_blocks: bool = True
-    residual_filter: bool = True
-    full_grid_field: bool = True
+    residual_filter: bool = False
+    full_grid_field: bool = False
     laplacian_input: bool = True
+    filter_input_version: int = 2
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -57,11 +58,10 @@ class OverfitConfig:
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
-    lambda_forward: float = 1.0
     lambda_local: float = 1.5
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
-    lambda_extension: float = 1.0
+    lambda_extension: float = 0.0
     physics_warmup_steps: int = 0
     gradient_every: int = 50
     comet: bool = False
@@ -106,13 +106,13 @@ class OverfitConfig:
             residual_filter=self.residual_filter,
             full_grid_field=self.full_grid_field,
             laplacian_input=self.laplacian_input,
+            filter_input_version=self.filter_input_version,
         )
         LossWeights(
-            self.lambda_forward,
-            self.lambda_local,
-            self.lambda_chi,
-            self.lambda_physics,
-            self.lambda_extension,
+            local=self.lambda_local,
+            chi=self.lambda_chi,
+            physics=self.lambda_physics,
+            extension=self.lambda_extension,
         )
         LossNormalization(self.chi_loss_floor, self.field_loss_floor)
         if min(self.physics_warmup_steps, self.gradient_every) < 0:
@@ -171,6 +171,8 @@ def _run_overfit(
             or resumed["model_config"]["threshold"] != config.threshold
             or resumed["model_config"].get("laplacian_input", False)
             != config.laplacian_input
+            or resumed["model_config"].get("filter_input_version", 1)
+            != config.filter_input_version
         ):
             raise ValueError(
                 "Resume must preserve model capacity, phase-filter input channels, and TKD threshold"
@@ -187,7 +189,6 @@ def _run_overfit(
             "normalize_loss",
             "chi_loss_floor",
             "field_loss_floor",
-            "lambda_forward",
             "lambda_local",
             "lambda_chi",
             "lambda_physics",
@@ -249,6 +250,7 @@ def _run_overfit(
             residual_filter=config.residual_filter,
             full_grid_field=config.full_grid_field,
             laplacian_input=config.laplacian_input,
+            filter_input_version=config.filter_input_version,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -319,11 +321,10 @@ def _run_overfit(
                 )
             )
     weights = LossWeights(
-        config.lambda_forward,
-        config.lambda_local,
-        config.lambda_chi,
-        config.lambda_physics,
-        config.lambda_extension,
+        local=config.lambda_local,
+        chi=config.lambda_chi,
+        physics=config.lambda_physics,
+        extension=config.lambda_extension,
     )
     normalization = (
         LossNormalization(config.chi_loss_floor, config.field_loss_floor)
@@ -591,7 +592,11 @@ def main(argv: list[str] | None = None) -> None:
             overrides["resume"], weights_only=True, map_location="cpu", mmap=True
         )
         values.update(checkpoint["config"])
+        values.pop("lambda_forward", None)
         values["laplacian_input"] = checkpoint["config"].get("laplacian_input", False)
+        values["filter_input_version"] = checkpoint["config"].get(
+            "filter_input_version", 1
+        )
         del checkpoint
     values.update(overrides)
     values["features"] = tuple(values["features"])

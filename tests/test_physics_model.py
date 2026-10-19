@@ -61,7 +61,9 @@ class PhysicsAndModelTests(unittest.TestCase):
         mask = torch.ones_like(phase)
         mask[..., :2, :, :] = 0
         for residual in (False, True):
-            model = DNQSM(ModelConfig((2, 4), residual_filter=residual))
+            model = DNQSM(
+                ModelConfig((2, 4), residual_filter=residual, filter_input_version=1)
+            )
             with torch.no_grad():
                 model.filter.final.weight.zero_()
                 model.filter.final.bias.zero_()
@@ -101,7 +103,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         # Deliberately leave the result unmasked to preserve this property.
         self.assertGreater(float(result.correction.detach()[mask == 0].abs().sum()), 0)
 
-    def test_four_penalties_and_pre_tkd_reference_gradient(self):
+    def test_loss_has_no_predicted_field_consistency_penalty(self):
         shape = (8, 8, 8)
         chi = (torch.randn(1, 1, *shape) * 0.01).requires_grad_()
         local = torch.full_like(chi, 0.02, requires_grad=True)
@@ -110,22 +112,19 @@ class PhysicsAndModelTests(unittest.TestCase):
         dipole = dipole_tensor(shape)
         prediction = Reconstruction(local, chi, chi * 0, chi)
         local_gt, chi_gt = torch.zeros_like(chi), torch.ones_like(chi) * 0.01
-        weights = LossWeights(2, 3, 4)
+        weights = LossWeights(local=3, chi=4, physics=2, extension=0)
         loss, terms = reconstruction_loss(
             prediction, local_gt, chi_gt, mask, dipole, weights, normalization=None
         )
-        self.assertEqual(
-            set(terms), {"forward", "physics", "local", "chi", "extension"}
-        )
+        self.assertEqual(set(terms), {"physics", "local", "chi"})
         torch.testing.assert_close(
             loss,
             sum(getattr(weights, name) * value for name, value in terms.items()),
         )
-        expected = masked_mean(
-            (apply_dipole(chi, dipole) - local).square(), mask
-        ).mean()
-        torch.testing.assert_close(terms["forward"], expected)
-        terms["forward"].backward(retain_graph=True)
+        loss.backward()
+        # With chi independent here, the only local-field gradient is ROI L1.
+        # No consistency gradient from A(chi) to the predicted local field remains.
+        torch.testing.assert_close(local.grad, weights.local * mask / mask.sum())
         self.assertGreater(float(local.grad.abs().sum()), 0)
         self.assertGreater(float(chi.grad.abs().sum()), 0)
         self.assertTrue(bool((local.grad[mask == 0] == 0).all()))
@@ -143,7 +142,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         _, terms = reconstruction_loss(
             prediction, clean, clean, mask, dipole, normalization=None
         )
-        self.assertEqual(float(terms["forward"].detach()), 0)
+        self.assertNotIn("forward", terms)
         torch.testing.assert_close(
             terms["physics"],
             masked_mean(apply_dipole(chi, dipole).square(), mask).mean(),

@@ -53,13 +53,13 @@ class OverfitTests(unittest.TestCase):
                     {
                         "start_step": 0,
                         "learning_rate": 1e-3,
-                        "residual_filter": True,
+                        "residual_filter": False,
                         "min_lr_factor": 0.05,
                     },
                     {
                         "start_step": 2,
                         "learning_rate": 1e-4,
-                        "residual_filter": True,
+                        "residual_filter": False,
                         "min_lr_factor": 0.05,
                     },
                 ],

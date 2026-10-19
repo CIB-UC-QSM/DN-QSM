@@ -1,4 +1,4 @@
-"""Physical-unit supervision and consistency with predicted and clean fields."""
+"""Physical-unit supervision against clean local fields and susceptibility."""
 
 import math
 from dataclasses import dataclass
@@ -8,7 +8,7 @@ from torch import Tensor
 from .model import Reconstruction
 from .physics import apply_dipole, masked_mean, validate_mask
 
-LOSS_VERSION = 3
+LOSS_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -28,7 +28,6 @@ class LossNormalization:
 
 @dataclass(frozen=True)
 class LossWeights:
-    forward: float = 1.0
     local: float = 1.5
     chi: float = 1.0
     physics: float = 1.0
@@ -39,7 +38,6 @@ class LossWeights:
             any(
                 not math.isfinite(v) or v < 0
                 for v in (
-                    self.forward,
                     self.local,
                     self.chi,
                     self.physics,
@@ -50,8 +48,22 @@ class LossWeights:
             or self.chi == 0
         ):
             raise ValueError(
-                "Local/chi weights must be positive; forward/physics weights nonnegative"
+                "Local/chi weights must be positive; physics/extension weights nonnegative"
             )
+
+
+def local_field_loss_terms(
+    local_field: Tensor, local_target: Tensor, mask: Tensor
+) -> dict[str, Tensor]:
+    """ROI supervision shared by independent filtering and joint training."""
+    validate_mask(mask, local_field)
+    if local_target.shape != mask.shape:
+        raise ValueError("Target and prediction shapes must agree")
+    return {
+        "local": masked_mean(
+            (local_field.float() - local_target.detach().float()).abs(), mask
+        )
+    }
 
 
 def per_sample_loss_terms(
@@ -63,6 +75,7 @@ def per_sample_loss_terms(
     *,
     local_full_target: Tensor | None = None,
     predicted_field: Tensor | None = None,
+    include_extension: bool = True,
 ) -> dict[str, Tensor]:
     """Return raw [N,1] penalties; targets never receive gradients."""
     validate_mask(mask, prediction.chi)
@@ -72,9 +85,9 @@ def per_sample_loss_terms(
         local_target.detach().float(),
         chi_target.detach().float(),
     )
-    if local_full_target is None:
+    if include_extension and local_full_target is None:
         local_full_target = apply_dipole(chi_target * mask, dipole).detach()
-    if local_full_target.shape != mask.shape:
+    if include_extension and local_full_target.shape != mask.shape:
         raise ValueError("Full-grid local target and prediction shapes must agree")
     field = (
         apply_dipole(prediction.chi, dipole)
@@ -83,23 +96,19 @@ def per_sample_loss_terms(
     )
     if field.shape != mask.shape:
         raise ValueError("Predicted forward field and mask shapes must agree")
-    return {
-        "forward": masked_mean(
-            (field - prediction.local_field.float()).square(),
-            mask,
-        ),
+    terms = {
         # Ground-truth physics supervision is independent of the learned filter:
         # a jointly biased chi/filter pair cannot make this penalty vanish.
         "physics": masked_mean((field - local_target.float()).square(), mask),
-        "local": masked_mean(
-            (prediction.local_field.float() - local_target.float()).abs(), mask
-        ),
+        **local_field_loss_terms(prediction.local_field, local_target, mask),
         "chi": masked_mean((prediction.chi.float() - chi_target.float()).abs(), mask),
-        "extension": masked_mean(
+    }
+    if include_extension:
+        terms["extension"] = masked_mean(
             (prediction.local_field.float() - local_full_target.detach().float()).abs(),
             1 - mask.float(),
-        ),
-    }
+        )
+    return terms
 
 
 def normalize_loss_terms(
@@ -137,7 +146,6 @@ def normalize_loss_terms(
         chi=chi_scale,
         local=field_energy.sqrt(),
         extension=field_energy.sqrt(),
-        forward=mse_energy,
         physics=mse_energy,
     )
     return {name: value / scales[name] for name, value in terms.items()}
@@ -163,6 +171,7 @@ def reconstruction_loss(
         mask,
         dipole,
         local_full_target=local_full_target,
+        include_extension=bool(weights.extension),
     )
     terms = {
         name: value.mean()

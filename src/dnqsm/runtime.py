@@ -56,6 +56,7 @@ def load_trained_model(
     # Historical checkpoints were trained with a zeroed exterior field.
     config.setdefault("full_grid_field", False)
     config.setdefault("laplacian_input", False)
+    config.setdefault("filter_input_version", 1)
     config["features"] = tuple(config["features"])
     model = DNQSM(ModelConfig(**config)).to(device)
     model.load_state_dict(saved["model"])

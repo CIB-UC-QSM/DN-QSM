@@ -403,6 +403,7 @@ def _evaluate_case(
             threshold=model.config.threshold,
             full_grid_field=model.config.full_grid_field,
             laplacian_input=model.config.laplacian_input,
+            filter_input_version=model.config.filter_input_version,
             grid_shape=list(phase.shape[-3:]),
             device=str(target),
             bf16=bool(

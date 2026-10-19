@@ -25,6 +25,7 @@ from tests.helpers import make_dataset
 class TrainingAndLoggingTests(unittest.TestCase):
     def config(self, root: Path, data: Path, name: str) -> TrainConfig:
         return TrainConfig(
+            filter_pretrain_epochs=0,
             data_dir=str(data),
             cache_dir=str(root / "cache"),
             run_dir=str(root / name),
@@ -96,6 +97,10 @@ class TrainingAndLoggingTests(unittest.TestCase):
                 max_steps=1,
                 accumulation_steps=4,
                 max_train_volumes=3,
+                # Isolate accumulation from FFT roundoff in amplified backgrounds.
+                clean_probability=1.0,
+                strong_probability=0.0,
+                weak_probability=0.0,
             )
             captured = []
             original_clip = torch.nn.utils.clip_grad_norm_
@@ -106,6 +111,8 @@ class TrainingAndLoggingTests(unittest.TestCase):
                 return original_clip(parameters, *args, **kwargs)
 
             with (
+                # Keep convolution arithmetic consistent across batch sizes.
+                torch.backends.mkldnn.flags(enabled=False),
                 patch("dnqsm.training.reconstruction_figure", return_value=None),
                 patch.object(RunLogger, "figure"),
                 patch("torch.nn.utils.clip_grad_norm_", side_effect=capture_gradients),

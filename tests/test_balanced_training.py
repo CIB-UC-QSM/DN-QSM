@@ -46,7 +46,7 @@ class BalancedTrainingTests(unittest.TestCase):
         ).requires_grad_()
         raw = {
             k: torch.ones(2, 1, requires_grad=True)
-            for k in ("forward", "physics", "local", "chi", "extension")
+            for k in ("physics", "local", "chi", "extension")
         }
         baseline = normalize_loss_terms(raw, local, chi, mask, LossNormalization())
         actual = normalize_loss_terms(
@@ -57,15 +57,13 @@ class BalancedTrainingTests(unittest.TestCase):
             LossNormalization(mse_input_ratio_cap=10),
             input_field=field,
         )
-        for key in ("forward", "physics"):
-            torch.testing.assert_close(actual[key][0], baseline[key][0])
-            torch.testing.assert_close(actual[key][1], baseline[key][1] / 10000)
+        torch.testing.assert_close(actual["physics"][0], baseline["physics"][0])
+        torch.testing.assert_close(actual["physics"][1], baseline["physics"][1] / 10000)
         for key in ("local", "chi", "extension"):
             torch.testing.assert_close(actual[key], baseline[key], rtol=0, atol=0)
         factor = 7
         scaled_raw = {
-            k: v * factor ** (2 if k in ("forward", "physics") else 1)
-            for k, v in raw.items()
+            k: v * factor ** (2 if k == "physics" else 1) for k, v in raw.items()
         }
         scaled = normalize_loss_terms(
             scaled_raw,
@@ -259,6 +257,7 @@ class BalancedTrainingTests(unittest.TestCase):
                 device="cpu",
                 features=(2, 4),
                 epochs=2,
+                filter_pretrain_epochs=0,
                 batch_size=2,
                 max_train_volumes=2,
                 val_views=1,

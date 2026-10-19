@@ -1,4 +1,4 @@
-"""End-to-end DN-QSM training with deterministic views and resumable updates."""
+"""Filter pretraining and end-to-end DN-QSM with resumable deterministic views."""
 
 import argparse
 import json
@@ -27,11 +27,12 @@ from .data import (
     training_records,
 )
 from .diagnostics import loss_gradient_metrics, quality_totals, summarize_quality
-from .logging import RunLogger, reconstruction_figure, write_json
+from .logging import RunLogger, filtering_figure, reconstruction_figure, write_json
 from .losses import (
     LOSS_VERSION,
     LossNormalization,
     LossWeights,
+    local_field_loss_terms,
     normalize_loss_terms,
     per_sample_loss_terms,
 )
@@ -63,6 +64,7 @@ class TrainConfig:
     cuda_memory_gb: float = 0.0
     cuda_allocator_config: str = ""
     epochs: int = 50
+    filter_pretrain_epochs: int = 10
     batch_size: int = 1
     accumulation_steps: int = 5
     num_workers: int = 4
@@ -83,17 +85,17 @@ class TrainConfig:
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = True
     residual_filter: bool = False
-    full_grid_field: bool = True
+    full_grid_field: bool = False
     laplacian_input: bool = True
+    filter_input_version: int = 2
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
     mse_input_ratio_cap: float = 0.0
-    lambda_forward: float = 1.0
     lambda_local: float = 1.5
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
-    lambda_extension: float = 1.0
+    lambda_extension: float = 0.0
     physics_warmup_epochs: int = 0
     background_profile: str = "mixture"
     background_curriculum_epochs: int = 5
@@ -121,6 +123,11 @@ class TrainConfig:
     sim2_pad: int = 20
 
     def validate(self) -> None:
+        if (
+            type(self.filter_pretrain_epochs) is not int
+            or self.filter_pretrain_epochs < 0
+        ):
+            raise ValueError("Filter pretraining epochs must be a nonnegative integer")
         positive = (
             self.epochs,
             self.batch_size,
@@ -179,13 +186,13 @@ class TrainConfig:
             self.residual_filter,
             self.full_grid_field,
             self.laplacian_input,
+            self.filter_input_version,
         )
         LossWeights(
-            self.lambda_forward,
-            self.lambda_local,
-            self.lambda_chi,
-            self.lambda_physics,
-            self.lambda_extension,
+            local=self.lambda_local,
+            chi=self.lambda_chi,
+            physics=self.lambda_physics,
+            extension=self.lambda_extension,
         )
         LossNormalization(
             self.chi_loss_floor, self.field_loss_floor, self.mse_input_ratio_cap
@@ -234,6 +241,7 @@ def model_config(config: TrainConfig) -> ModelConfig:
         config.residual_filter,
         config.full_grid_field,
         config.laplacian_input,
+        config.filter_input_version,
     )
 
 
@@ -249,11 +257,10 @@ def normalization_config(config):
 
 def training_weights(config, step=0, warmup_steps=0):
     weights = LossWeights(
-        config.lambda_forward,
-        config.lambda_local,
-        config.lambda_chi,
-        config.lambda_physics,
-        config.lambda_extension,
+        local=config.lambda_local,
+        chi=config.lambda_chi,
+        physics=config.lambda_physics,
+        extension=config.lambda_extension,
     )
     if warmup_steps:
         weights = replace(
@@ -280,6 +287,66 @@ def learning_rate_multiplier(step: int, warmup: int, total: int, floor: float) -
         return (step + 1) / warmup
     progress = min(1.0, max(0.0, (step - warmup) / max(1, total - warmup - 1)))
     return floor + (1 - floor) * (1 + math.cos(math.pi * progress)) / 2
+
+
+def phase_metadata(config: TrainConfig, epoch: int) -> dict:
+    """Describe the next/current epoch using zero-based checkpoint positions."""
+    pretraining = epoch < config.filter_pretrain_epochs
+    return dict(
+        phase="filter_pretrain" if pretraining else "end_to_end",
+        phase_epoch=epoch + 1
+        if pretraining
+        else epoch - config.filter_pretrain_epochs + 1,
+    )
+
+
+def phased_learning_rate_multiplier(config, step, updates_per_epoch):
+    pretrain_steps = config.filter_pretrain_epochs * updates_per_epoch
+    if step < pretrain_steps:
+        total = pretrain_steps
+    else:
+        step -= pretrain_steps
+        total = config.epochs * updates_per_epoch
+    warmup = min(config.warmup_epochs * updates_per_epoch, total)
+    return learning_rate_multiplier(step, warmup, total, config.min_lr_factor)
+
+
+def checkpoint_training_config(saved: dict) -> dict:
+    """Fill historical defaults without changing an existing run's behavior."""
+    values = dict(saved)
+    # Resume reaches the loss-version guard rather than failing on an old key.
+    values.pop("lambda_forward", None)
+    values.setdefault("filter_input_version", 1)
+    values.setdefault("filter_pretrain_epochs", 0)
+    values.setdefault("full_grid_field", False)
+    values.setdefault("lambda_extension", 1.0 if values["full_grid_field"] else 0.0)
+    values.setdefault("residual_filter", False)
+    values.setdefault("crop_resize", False)
+    values.setdefault("laplacian_input", False)
+    return values
+
+
+def _predict_training_batch(model, data, device, bf16, filter_only, include_extension):
+    with autocast_context(device, bf16):
+        output = (
+            model.predict_local_field(data["phase"], data["mask"])
+            if filter_only
+            else model(data["phase"], data["mask"], data["dipole"])
+        )
+    if filter_only:
+        return output, local_field_loss_terms(output, data["local"], data["mask"]), None
+    predicted_field = apply_dipole(output.chi, data["dipole"])
+    raw = per_sample_loss_terms(
+        output,
+        data["local"],
+        data["chi"],
+        data["mask"],
+        data["dipole"],
+        local_full_target=data["local_full"],
+        predicted_field=predicted_field,
+        include_extension=include_extension,
+    )
+    return output, raw, predicted_field
 
 
 def _worker_init(_worker_id: int) -> None:
@@ -364,6 +431,7 @@ def backward_batch(
     *,
     gradient_diagnostics=False,
     background_progress=1.0,
+    filter_only=False,
 ):
     """Accumulate equally weighted samples across their model-input grids."""
     totals = defaultdict(float)
@@ -375,17 +443,8 @@ def backward_batch(
         )
         count = data["chi"].shape[0]
         fraction = count / group_samples
-        with autocast_context(device, config.bf16):
-            output = model(data["phase"], data["mask"], data["dipole"])
-        predicted_field = apply_dipole(output.chi, data["dipole"])
-        raw = per_sample_loss_terms(
-            output,
-            data["local"],
-            data["chi"],
-            data["mask"],
-            data["dipole"],
-            local_full_target=data["local_full"],
-            predicted_field=predicted_field,
+        output, raw, predicted_field = _predict_training_batch(
+            model, data, device, config.bf16, filter_only, bool(weights.extension)
         )
         terms = {
             name: value.mean()
@@ -415,7 +474,9 @@ def backward_batch(
         ).items():
             totals[name] += value
         if figure_title is not None and figure is None:
-            figure = reconstruction_figure(data, output, figure_title)
+            figure = (filtering_figure if filter_only else reconstruction_figure)(
+                data, output, figure_title
+            )
         samples += count
         if "crop_applied" in shaped_batch:
             cropped += int(shaped_batch["crop_applied"].sum())
@@ -434,6 +495,7 @@ def validate(
     *,
     normalization=LossNormalization(),
     synthesis_options=None,
+    filter_only=False,
 ):
     model.eval()
     subjects = defaultdict(list)
@@ -443,17 +505,8 @@ def validate(
         data = synthesizer(
             batch, **(synthesis_options or dict(background_mode="mixture"))
         )
-        with autocast_context(device, bf16):
-            output = model(data["phase"], data["mask"], data["dipole"])
-        predicted_field = apply_dipole(output.chi, data["dipole"])
-        raw = per_sample_loss_terms(
-            output,
-            data["local"],
-            data["chi"],
-            data["mask"],
-            data["dipole"],
-            local_full_target=data["local_full"],
-            predicted_field=predicted_field,
+        output, raw, predicted_field = _predict_training_batch(
+            model, data, device, bf16, filter_only, bool(weights.extension)
         )
         per_sample = {
             name: values.flatten()
@@ -476,15 +529,22 @@ def validate(
             output, data, predicted_field=predicted_field
         ).items():
             quality[name] += value
-        chi_errors = masked_nrmse(output.chi, data["chi"], data["mask"])
-        local_errors = masked_nrmse(output.local_field, data["local"], data["mask"])
-        tkd_errors = masked_nrmse(output.tkd, data["chi"], data["mask"])
+        errors = dict(
+            local_nrmse=masked_nrmse(
+                output if filter_only else output.local_field,
+                data["local"],
+                data["mask"],
+            )
+        )
+        if not filter_only:
+            errors.update(
+                chi_nrmse=masked_nrmse(output.chi, data["chi"], data["mask"]),
+                tkd_nrmse=masked_nrmse(output.tkd, data["chi"], data["mask"]),
+            )
         for index, subject in enumerate(batch["subject"]):
             subjects[subject].append(
                 dict(
-                    chi_nrmse=chi_errors[index],
-                    local_nrmse=local_errors[index],
-                    tkd_nrmse=tkd_errors[index],
+                    **{name: values[index] for name, values in errors.items()},
                     **{
                         name: float(values[index])
                         for name, values in per_sample.items()
@@ -492,7 +552,7 @@ def validate(
                 )
             )
         if first is None:
-            first = reconstruction_figure(
+            first = (filtering_figure if filter_only else reconstruction_figure)(
                 data, output, "Held-out validation (physical units)"
             )
     result = {}
@@ -566,7 +626,8 @@ def run_training(config: TrainConfig) -> Path:
             raise ValueError("Unsupported checkpoint version")
         if resume.get("loss_version", 1) != LOSS_VERSION:
             raise ValueError(
-                "Checkpoint uses an older loss. Use --init-checkpoint to start a new run with the updated physics supervision."
+                "Checkpoint uses an older loss. Use --init-checkpoint to start "
+                "a new run with the current objective."
             )
         # Scheduling, sampling, and model changes cannot silently alter a resume.
         runtime = {
@@ -590,10 +651,7 @@ def run_training(config: TrainConfig) -> Path:
             "gradient_every",
         }
         current = json.loads(json.dumps(asdict(config)))
-        previous = json.loads(json.dumps(resume["config"]))
-        previous.setdefault("residual_filter", False)
-        previous.setdefault("crop_resize", False)
-        previous.setdefault("laplacian_input", False)
+        previous = checkpoint_training_config(json.loads(json.dumps(resume["config"])))
         for key in (
             "crop_probability",
             "external_eval_every",
@@ -630,14 +688,30 @@ def run_training(config: TrainConfig) -> Path:
         chi_scale_mode="legacy",
     )
     write_json(directory / "config.json", asdict(config))
-    write_json(directory / "status.json", dict(status="running", device=str(device)))
+    write_json(
+        directory / "status.json",
+        dict(
+            status="running",
+            device=str(device),
+            **phase_metadata(config, resume["epoch"] if resume else 0),
+        ),
+    )
     model = DNQSM(model_config(config)).to(device)
     if config.init_checkpoint:
         initialized = load_trained_model(config.init_checkpoint, "cpu")
-        if initialized.config.laplacian_input != config.laplacian_input:
+        if any(
+            getattr(initialized.config, name) != getattr(config, name)
+            for name in (
+                "filter_input_version",
+                "laplacian_input",
+                "residual_filter",
+                "full_grid_field",
+            )
+        ):
             raise ValueError(
-                "Initialization checkpoint has different phase-filter input channels. "
-                "Start a fresh run for the updated architecture, or match --laplacian-input/--no-laplacian-input."
+                "Initialization checkpoint has a different filtering architecture. "
+                "Start a fresh run for masked Laplacian-only filtering, or match "
+                "the checkpoint's filter-input-version, input channels, and masking."
             )
         model.load_state_dict(initialized.state_dict())
         del initialized
@@ -654,14 +728,11 @@ def run_training(config: TrainConfig) -> Path:
     )
     batches_per_epoch = math.ceil(len(training_set) / config.batch_size)
     updates_per_epoch = math.ceil(batches_per_epoch / config.accumulation_steps)
-    total_steps = updates_per_epoch * config.epochs
-    warmup_steps = min(config.warmup_epochs * updates_per_epoch, total_steps)
+    pretrain_steps = updates_per_epoch * config.filter_pretrain_epochs
     physics_warmup_steps = config.physics_warmup_epochs * updates_per_epoch
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda s: learning_rate_multiplier(
-            s, warmup_steps, total_steps, config.min_lr_factor
-        ),
+        lambda s: phased_learning_rate_multiplier(config, s, updates_per_epoch),
     )
     epoch, next_batch, step, best = 0, 0, 0, float("inf")
     epoch_samples = epoch_cropped = 0
@@ -710,6 +781,7 @@ def run_training(config: TrainConfig) -> Path:
             epoch_clipped=epoch_clipped,
             physics_grid_version=2,
             validation_profile=validation_profile,
+            **phase_metadata(config, epoch),
         )
         atomic_save(payload, directory / "model_last.pt")
         atomic_save(
@@ -725,12 +797,6 @@ def run_training(config: TrainConfig) -> Path:
     try:
         logger = RunLogger(directory, config, resume=is_resuming)
         cases = None
-        if config.external_eval_every:
-            cases = evaluation.load_cases(
-                data_dir=config.evaluation_data_dir or None,
-                cosmos_simulation=config.cosmos_simulation,
-                sim2_pad=config.sim2_pad,
-            )
         logger.log(
             "started",
             step,
@@ -752,13 +818,20 @@ def run_training(config: TrainConfig) -> Path:
             normalize_loss=config.normalize_loss,
             full_grid_field=config.full_grid_field,
             laplacian_input=config.laplacian_input,
+            filter_input_version=config.filter_input_version,
+            filter_pretrain_epochs=config.filter_pretrain_epochs,
+            end_to_end_epochs=config.epochs,
+            **phase_metadata(config, epoch),
         )
-        while epoch < config.epochs:
+        while epoch < config.filter_pretrain_epochs + config.epochs:
+            phase = phase_metadata(config, epoch)
+            filter_only = epoch < config.filter_pretrain_epochs
+            model.null_network.requires_grad_(not filter_only)
             if config.max_steps and step >= config.max_steps:
                 save()
                 write_json(
                     directory / "status.json",
-                    dict(status="bounded", step=step, epoch=epoch),
+                    dict(status="bounded", step=step, epoch=epoch, **phase),
                 )
                 return directory
             training_set.set_epoch(epoch)
@@ -790,7 +863,9 @@ def run_training(config: TrainConfig) -> Path:
                     batch,
                     synthesizer,
                     device,
-                    training_weights(config, step, physics_warmup_steps),
+                    training_weights(
+                        config, max(0, step - pretrain_steps), physics_warmup_steps
+                    ),
                     config,
                     group_samples,
                     f"Training epoch {epoch + 1}" if train_figure is None else None,
@@ -800,6 +875,7 @@ def run_training(config: TrainConfig) -> Path:
                         and (step == 0 or (step + 1) % config.gradient_every == 0)
                     ),
                     background_progress=background_progress,
+                    filter_only=filter_only,
                 )
                 for name, value in terms.items():
                     group_terms[name] += value
@@ -848,8 +924,13 @@ def run_training(config: TrainConfig) -> Path:
                         gradient_clipped=clipped,
                         gradient_clip_threshold=config.grad_clip,
                         active_physics_weight=training_weights(
-                            config, step - 1, physics_warmup_steps
-                        ).physics,
+                            config,
+                            max(0, step - pretrain_steps - 1),
+                            physics_warmup_steps,
+                        ).physics
+                        if not filter_only
+                        else 0.0,
+                        **phase,
                         background_curriculum_progress=background_progress,
                         seconds=time.perf_counter() - started,
                         **memory,
@@ -880,6 +961,7 @@ def run_training(config: TrainConfig) -> Path:
                             step=step,
                             epoch=epoch,
                             next_batch=next_batch,
+                            **phase,
                         ),
                     )
                     return directory
@@ -895,6 +977,7 @@ def run_training(config: TrainConfig) -> Path:
                 samples=epoch_samples,
                 cropped_samples=epoch_cropped,
                 crop_fraction=epoch_cropped / max(1, epoch_samples),
+                **phase,
             )
             logger.log(
                 "optimization",
@@ -904,6 +987,7 @@ def run_training(config: TrainConfig) -> Path:
                 clipped_updates=epoch_clipped,
                 clipping_fraction=epoch_clipped / updates_per_epoch,
                 background_curriculum_progress=background_progress,
+                **phase,
             )
             metrics, figure = validate(
                 model,
@@ -913,13 +997,16 @@ def run_training(config: TrainConfig) -> Path:
                 weights,
                 config.bf16,
                 normalization=normalization_config(config),
+                filter_only=filter_only,
                 synthesis_options=(
                     config.validation_synthesis
                     if config.validation_synthesis is not None
                     else background_options(config)
                 ),
             )
-            logger.log("validation", step, epoch + 1, comet_step=epoch + 1, **metrics)
+            logger.log(
+                "validation", step, epoch + 1, comet_step=epoch + 1, **phase, **metrics
+            )
             if figure is not None:
                 logger.figure(figure, "validation", epoch + 1, epoch + 1)
             stress_metrics, stress_figure = validate(
@@ -930,6 +1017,7 @@ def run_training(config: TrainConfig) -> Path:
                 weights,
                 config.bf16,
                 normalization=normalization_config(config),
+                filter_only=filter_only,
                 synthesis_options=dict(background_mode="legacy"),
             )
             logger.log(
@@ -937,15 +1025,16 @@ def run_training(config: TrainConfig) -> Path:
                 step,
                 epoch + 1,
                 comet_step=epoch + 1,
+                **phase,
                 **stress_metrics,
             )
             if stress_figure is not None:
                 logger.figure(stress_figure, "validation_stress", epoch + 1, epoch + 1)
-            if metrics["chi_nrmse"] is None:
+            if not filter_only and metrics["chi_nrmse"] is None:
                 raise ValueError(
                     "All validation susceptibility references have zero energy"
                 )
-            if metrics["chi_nrmse"] < best:
+            if not filter_only and metrics["chi_nrmse"] < best:
                 best = metrics["chi_nrmse"]
                 atomic_save(
                     dict(
@@ -958,13 +1047,21 @@ def run_training(config: TrainConfig) -> Path:
                         epoch=epoch + 1,
                         best=best,
                         validation_profile=validation_profile,
+                        **phase,
                     ),
                     directory / "model_best.pt",
                 )
             if (
-                config.external_eval_every
-                and (epoch + 1) % config.external_eval_every == 0
+                not filter_only
+                and config.external_eval_every
+                and phase["phase_epoch"] % config.external_eval_every == 0
             ):
+                if cases is None:
+                    cases = evaluation.load_cases(
+                        data_dir=config.evaluation_data_dir or None,
+                        cosmos_simulation=config.cosmos_simulation,
+                        sim2_pad=config.sim2_pad,
+                    )
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 evaluation.evaluate_training_epoch(
@@ -984,17 +1081,35 @@ def run_training(config: TrainConfig) -> Path:
             save()
             write_json(
                 directory / "status.json",
-                dict(status="running", step=step, epoch=epoch, best_chi_nrmse=best),
+                dict(
+                    status="running",
+                    step=step,
+                    epoch=epoch,
+                    best_chi_nrmse=best if math.isfinite(best) else None,
+                    **phase_metadata(config, epoch),
+                ),
             )
             if STOP_REQUESTED:
                 write_json(
                     directory / "status.json",
-                    dict(status="interrupted", step=step, epoch=epoch, next_batch=0),
+                    dict(
+                        status="interrupted",
+                        step=step,
+                        epoch=epoch,
+                        next_batch=0,
+                        **phase_metadata(config, epoch),
+                    ),
                 )
                 return directory
         write_json(
             directory / "status.json",
-            dict(status="trained", step=step, epoch=epoch, best_chi_nrmse=best),
+            dict(
+                status="trained",
+                step=step,
+                epoch=epoch,
+                best_chi_nrmse=best,
+                **phase_metadata(config, epoch - 1),
+            ),
         )
         if config.evaluate_external:
             # Evaluation loads the best checkpoint into a separate model.
@@ -1027,13 +1142,20 @@ def run_training(config: TrainConfig) -> Path:
                 epoch=epoch,
                 best_chi_nrmse=best,
                 external_evaluation=config.evaluate_external,
+                **phase_metadata(config, epoch - 1),
             ),
         )
         return directory
     except BaseException as error:
         write_json(
             directory / "status.json",
-            dict(status="failed", step=step, epoch=epoch, error=str(error)),
+            dict(
+                status="failed",
+                step=step,
+                epoch=epoch,
+                error=str(error),
+                **phase_metadata(config, epoch),
+            ),
         )
         raise
     finally:
@@ -1091,10 +1213,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         saved = torch.load(
             overrides["resume"], weights_only=True, map_location="cpu", mmap=True
         )
-        values.update(saved["config"])
-        # Exact resume preserves the native-crop behavior of older checkpoints.
-        values["crop_resize"] = saved["config"].get("crop_resize", False)
-        values["laplacian_input"] = saved["config"].get("laplacian_input", False)
+        values.update(checkpoint_training_config(saved["config"]))
         values["init_checkpoint"] = None
     values.update(overrides)
     values["features"] = tuple(values["features"])

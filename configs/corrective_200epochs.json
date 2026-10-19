@@ -1,8 +1,12 @@
 {
   "epochs": 200,
-  "features": [23, 47, 90],
-  "residual_filter": true,
-  "full_grid_field": true,
+  "features": [
+    23,
+    47,
+    90
+  ],
+  "residual_filter": false,
+  "full_grid_field": false,
   "checkpoint_blocks": true,
   "bf16": true,
   "normalize_loss": true,
@@ -11,8 +15,7 @@
   "lambda_chi": 1.0,
   "lambda_local": 1.5,
   "lambda_physics": 1.0,
-  "lambda_forward": 1.0,
-  "lambda_extension": 1.0,
+  "lambda_extension": 0.0,
   "physics_warmup_epochs": 0,
   "background_profile": "mixture",
   "background_curriculum_epochs": 5,
@@ -22,7 +25,7 @@
   "weak_probability": 0.1,
   "crop_probability": 0.2,
   "crop_resize": true,
-  "learning_rate": 0.00003,
+  "learning_rate": 3e-05,
   "grad_clip": 10.0,
   "gradient_every": 100,
   "batch_size": 1,
@@ -32,5 +35,8 @@
   "evaluate_external": true,
   "comet": true,
   "comet_project": "dn-qsm",
-  "seed": 0
+  "seed": 0,
+  "laplacian_input": true,
+  "filter_input_version": 2,
+  "filter_pretrain_epochs": 10
 }

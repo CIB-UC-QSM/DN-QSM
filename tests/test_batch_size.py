@@ -58,6 +58,7 @@ class BatchSizeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, redirect_stdout(io.StringIO()):
             root = Path(temporary)
             config = TrainConfig(
+                filter_pretrain_epochs=0,
                 data_dir=str(make_dataset(root)),
                 cache_dir=str(root / "cache"),
                 device="cpu",

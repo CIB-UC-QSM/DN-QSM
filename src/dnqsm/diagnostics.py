@@ -9,7 +9,7 @@ from .physics import apply_dipole, masked_mean
 
 def loss_gradient_metrics(model, terms, weights):
     """Probe the existing graph without updating .grad, weights, or RNG state."""
-    named = list(model.named_parameters())
+    named = [(name, p) for name, p in model.named_parameters() if p.requires_grad]
     indices = {
         branch: [
             i for i, (name, _) in enumerate(named) if name.startswith(branch + ".")
@@ -29,17 +29,21 @@ def loss_gradient_metrics(model, terms, weights):
         for branch, positions in indices.items():
             # Keep cross-objective vectors on the host. The large overfit
             # profile must not retain five full parameter gradients in VRAM.
-            vector = torch.cat(
-                [
-                    (
-                        gradients[i]
-                        if gradients[i] is not None
-                        else torch.zeros_like(named[i][1])
-                    )
-                    .detach()
-                    .flatten()
-                    for i in positions
-                ]
+            vector = (
+                torch.cat(
+                    [
+                        (
+                            gradients[i]
+                            if gradients[i] is not None
+                            else torch.zeros_like(named[i][1])
+                        )
+                        .detach()
+                        .flatten()
+                        for i in positions
+                    ]
+                )
+                if positions
+                else torch.empty(0)
             ).cpu()
             vectors[name][branch] = vector
             norm = float(vector.norm())
@@ -61,11 +65,20 @@ def loss_gradient_metrics(model, terms, weights):
 def quality_totals(prediction, data, *, predicted_field=None):
     """Additive sums/counts stay correct across ragged groups and accumulation."""
     mask = data["mask"]
-    field = (
-        apply_dipole(prediction.chi, data["dipole"])
-        if predicted_field is None
-        else predicted_field.detach()
-    )
+    if isinstance(prediction, torch.Tensor):
+        comparisons = (("local", prediction, data["local"]),)
+    else:
+        field = (
+            apply_dipole(prediction.chi, data["dipole"])
+            if predicted_field is None
+            else predicted_field.detach()
+        )
+        comparisons = (
+            ("chi", prediction.chi, data["chi"]),
+            ("tkd", prediction.tkd, data["chi"]),
+            ("local", prediction.local_field, data["local"]),
+            ("physics", field, data["local"]),
+        )
     local_rms = masked_mean(data["local"].square(), mask).sqrt().flatten()
     background_rms = masked_mean(data["background"].square(), mask).sqrt().flatten()
     ratio = local_rms / background_rms.clamp_min(1e-12)
@@ -80,12 +93,7 @@ def quality_totals(prediction, data, *, predicted_field=None):
         f"bucket_{name}_samples": int(selected.sum())
         for name, selected in buckets.items()
     }
-    for name, value, reference in (
-        ("chi", prediction.chi, data["chi"]),
-        ("tkd", prediction.tkd, data["chi"]),
-        ("local", prediction.local_field, data["local"]),
-        ("physics", field, data["local"]),
-    ):
+    for name, value, reference in comparisons:
         denominator = masked_mean(reference.square(), mask).sqrt().flatten()
         valid = denominator > 0
         errors = (

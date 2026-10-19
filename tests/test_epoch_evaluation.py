@@ -86,6 +86,7 @@ class EpochEvaluationTests(unittest.TestCase):
             cases = self.cases(root)
             source = make_dataset(root)
             config = TrainConfig(
+                filter_pretrain_epochs=0,
                 data_dir=str(source),
                 cache_dir=str(root / "cache"),
                 run_dir=str(root / "run"),
