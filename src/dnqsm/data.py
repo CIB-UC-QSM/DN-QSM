@@ -296,9 +296,15 @@ class FieldSynthesizer(torch.nn.Module):
         strong_probability: float = 0.25,
         clean_probability: float = 0.15,
         weak_probability: float = 0.1,
+        snr_min: float = TRAINING_CONDITIONS["snr_min"],
+        snr_max: float = TRAINING_CONDITIONS["snr_max"],
     ):
         if background_mode not in ("legacy", "ratio", "mixture"):
             raise ValueError(f"Unknown background mode: {background_mode}")
+        if not all(math.isfinite(v) for v in (snr_min, snr_max)) or not (
+            0 < snr_min <= snr_max
+        ):
+            raise ValueError("SNR bounds must be finite, positive, and ordered")
         if (
             not math.isfinite(strong_min_ratio)
             or not 0 < strong_min_ratio <= 0.03
@@ -380,11 +386,7 @@ class FieldSynthesizer(torch.nn.Module):
                 torch.randn(signal.shape, device=device, generator=generator)
                 / reliability.clamp_min(reliability_floor).sqrt()
             )
-            snrs.append(
-                TRAINING_CONDITIONS["snr_min"]
-                + (TRAINING_CONDITIONS["snr_max"] - TRAINING_CONDITIONS["snr_min"])
-                * rand()
-            )
+            snrs.append(snr_min + (snr_max - snr_min) * rand())
 
         def inverse(x):
             return torch.fft.irfftn(x, s=self.shape, dim=SPATIAL)

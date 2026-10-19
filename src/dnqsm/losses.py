@@ -15,12 +15,15 @@ LOSS_VERSION = 3
 class LossNormalization:
     chi_floor: float = 1e-4
     field_floor: float = 1e-4
+    mse_input_ratio_cap: float = 0.0
 
     def __post_init__(self) -> None:
         if any(
             not math.isfinite(v) or v <= 0 for v in (self.chi_floor, self.field_floor)
         ):
             raise ValueError("Loss RMS floors must be finite and positive")
+        if not math.isfinite(self.mse_input_ratio_cap) or self.mse_input_ratio_cap < 0:
+            raise ValueError("MSE input-ratio cap must be finite and nonnegative")
 
 
 @dataclass(frozen=True)
@@ -105,6 +108,8 @@ def normalize_loss_terms(
     chi_target: Tensor,
     mask: Tensor,
     normalization: LossNormalization | None,
+    *,
+    input_field: Tensor | None = None,
 ) -> dict[str, Tensor]:
     if normalization is None:
         return terms
@@ -116,12 +121,24 @@ def normalize_loss_terms(
         .clamp_min(normalization.chi_floor**2)
         .sqrt()
     )
+    mse_energy = field_energy
+    if normalization.mse_input_ratio_cap:
+        if input_field is None or input_field.shape != mask.shape:
+            raise ValueError(
+                "Capped MSE normalization requires the aligned input field"
+            )
+        # Detached input/target scales cannot be changed by a prediction to
+        # reduce its own loss. Keep the L1 denominators target-relative.
+        input_energy = masked_mean(input_field.detach().float().square(), mask)
+        mse_energy = field_energy.maximum(
+            input_energy / normalization.mse_input_ratio_cap**2
+        )
     scales = dict(
         chi=chi_scale,
         local=field_energy.sqrt(),
         extension=field_energy.sqrt(),
-        forward=field_energy,
-        physics=field_energy,
+        forward=mse_energy,
+        physics=mse_energy,
     )
     return {name: value / scales[name] for name, value in terms.items()}
 
@@ -136,6 +153,7 @@ def reconstruction_loss(
     *,
     normalization: LossNormalization | None = LossNormalization(),
     local_full_target: Tensor | None = None,
+    input_field: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
     weights = weights or LossWeights()
     raw = per_sample_loss_terms(
@@ -149,7 +167,7 @@ def reconstruction_loss(
     terms = {
         name: value.mean()
         for name, value in normalize_loss_terms(
-            raw, local_target, chi_target, mask, normalization
+            raw, local_target, chi_target, mask, normalization, input_field=input_field
         ).items()
     }
     total = sum(getattr(weights, name) * value for name, value in terms.items())

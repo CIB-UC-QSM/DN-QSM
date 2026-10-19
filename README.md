@@ -251,6 +251,22 @@ These profiles do not start or modify an existing run. Before a new long run,
 repeat the fixed-case overfit gate and compare short ablations across seeds.
 Re-profile VRAM: exterior targets and sampled gradient diagnostics are now included.
 
+`configs/balanced_local_total_100epochs.json` targets both noisy local and total
+fields: 50% have no background, 10% weak, 35% typical, and 5% strong backgrounds
+after a 20-epoch curriculum. Training noise spans clean-local RMS SNR 5–100 via
+`--snr-min`/`--snr-max`; their defaults remain 40–100. Its `validation_synthesis`
+object preserves the preceding experiment's background mixture and SNR 40–100,
+recorded as the `reference` validation profile. Stress and external benchmarks
+remain unchanged. An explicit validation object can also be supplied as JSON
+with `--validation-synthesis`.
+
+The profile enables `--mse-input-ratio-cap 10`: forward and physics MSE use
+`max(RMS(local_gt), RMS(input)/10)^2` as their denominator, with the existing
+floor. Local, chi, and exterior L1 normalization and all coefficients stay the
+same. Scales are detached; conventional NRMSE remains target-relative. A cap
+of zero (the default) preserves historical normalization. New settings require
+a new experiment; exact resume rejects changed sampling or normalization.
+
 ```sh
 uv run python -m dnqsm.batch_size --config configs/corrective_200epochs.json \
   --directory artifacts/capacity/corrective --expandable-segments

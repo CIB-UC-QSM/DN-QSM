@@ -88,6 +88,7 @@ class TrainConfig:
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
+    mse_input_ratio_cap: float = 0.0
     lambda_forward: float = 1.0
     lambda_local: float = 1.5
     lambda_chi: float = 1.0
@@ -100,6 +101,9 @@ class TrainConfig:
     strong_probability: float = 0.25
     clean_probability: float = 0.15
     weak_probability: float = 0.1
+    snr_min: float = 40.0
+    snr_max: float = 100.0
+    validation_synthesis: dict | None = None
     gradient_every: int = 100
     bf16: bool = True
     comet: bool = False
@@ -183,7 +187,22 @@ class TrainConfig:
             self.lambda_physics,
             self.lambda_extension,
         )
-        LossNormalization(self.chi_loss_floor, self.field_loss_floor)
+        LossNormalization(
+            self.chi_loss_floor, self.field_loss_floor, self.mse_input_ratio_cap
+        )
+        if self.mse_input_ratio_cap and not self.normalize_loss:
+            raise ValueError("MSE input-ratio cap requires normalized losses")
+        if not all(math.isfinite(v) for v in (self.snr_min, self.snr_max)) or not (
+            0 < self.snr_min <= self.snr_max
+        ):
+            raise ValueError("SNR bounds must be finite, positive, and ordered")
+        if self.validation_synthesis is not None and (
+            not isinstance(self.validation_synthesis, dict)
+            or "background_mode" not in self.validation_synthesis
+        ):
+            raise ValueError(
+                "Validation synthesis must be an object with background_mode"
+            )
         if (
             self.background_profile not in ("mixture", "ratio", "legacy")
             or not math.isfinite(self.strong_min_ratio)
@@ -220,7 +239,9 @@ def model_config(config: TrainConfig) -> ModelConfig:
 
 def normalization_config(config):
     return (
-        LossNormalization(config.chi_loss_floor, config.field_loss_floor)
+        LossNormalization(
+            config.chi_loss_floor, config.field_loss_floor, config.mse_input_ratio_cap
+        )
         if config.normalize_loss
         else None
     )
@@ -249,6 +270,8 @@ def background_options(config, progress=1.0):
         strong_probability=config.strong_probability,
         clean_probability=config.clean_probability,
         weak_probability=config.weak_probability,
+        snr_min=config.snr_min,
+        snr_max=config.snr_max,
     )
 
 
@@ -372,6 +395,7 @@ def backward_batch(
                 data["chi"],
                 data["mask"],
                 normalization_config(config),
+                input_field=data["phase"],
             ).items()
         }
         loss = sum(getattr(weights, name) * value for name, value in terms.items())
@@ -434,7 +458,12 @@ def validate(
         per_sample = {
             name: values.flatten()
             for name, values in normalize_loss_terms(
-                raw, data["local"], data["chi"], data["mask"], normalization
+                raw,
+                data["local"],
+                data["chi"],
+                data["mask"],
+                normalization,
+                input_field=data["phase"],
             ).items()
         }
         per_sample["loss"] = sum(
@@ -514,6 +543,9 @@ def run_training(config: TrainConfig) -> Path:
     global STOP_REQUESTED
     STOP_REQUESTED = False
     config.validate()
+    validation_profile = (
+        "reference" if config.validation_synthesis is not None else "matched"
+    )
     if config.cuda_allocator_config:
         os.environ["PYTORCH_ALLOC_CONF"] = config.cuda_allocator_config
     device = require_device(config.device)
@@ -562,7 +594,15 @@ def run_training(config: TrainConfig) -> Path:
         previous.setdefault("residual_filter", False)
         previous.setdefault("crop_resize", False)
         previous.setdefault("laplacian_input", False)
-        for key in ("crop_probability", "external_eval_every", "cuda_allocator_config"):
+        for key in (
+            "crop_probability",
+            "external_eval_every",
+            "cuda_allocator_config",
+            "mse_input_ratio_cap",
+            "snr_min",
+            "snr_max",
+            "validation_synthesis",
+        ):
             previous.setdefault(key, getattr(TrainConfig(), key))
         changed = [
             key
@@ -669,7 +709,7 @@ def run_training(config: TrainConfig) -> Path:
             epoch_cropped=epoch_cropped,
             epoch_clipped=epoch_clipped,
             physics_grid_version=2,
-            validation_profile="matched",
+            validation_profile=validation_profile,
         )
         atomic_save(payload, directory / "model_last.pt")
         atomic_save(
@@ -708,7 +748,7 @@ def run_training(config: TrainConfig) -> Path:
             crop_resize=config.crop_resize,
             external_eval_every=config.external_eval_every,
             physics_grid_version=2,
-            validation_profile="matched",
+            validation_profile=validation_profile,
             normalize_loss=config.normalize_loss,
             full_grid_field=config.full_grid_field,
             laplacian_input=config.laplacian_input,
@@ -873,7 +913,11 @@ def run_training(config: TrainConfig) -> Path:
                 weights,
                 config.bf16,
                 normalization=normalization_config(config),
-                synthesis_options=background_options(config),
+                synthesis_options=(
+                    config.validation_synthesis
+                    if config.validation_synthesis is not None
+                    else background_options(config)
+                ),
             )
             logger.log("validation", step, epoch + 1, comet_step=epoch + 1, **metrics)
             if figure is not None:
@@ -913,7 +957,7 @@ def run_training(config: TrainConfig) -> Path:
                         step=step,
                         epoch=epoch + 1,
                         best=best,
-                        validation_profile="matched",
+                        validation_profile=validation_profile,
                     ),
                     directory / "model_best.pt",
                 )
@@ -1018,6 +1062,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             kwargs["action"] = argparse.BooleanOptionalAction
         elif name == "features":
             kwargs.update(type=int, nargs="+")
+        elif name == "validation_synthesis":
+            kwargs["type"] = json.loads
         else:
             kwargs["type"] = (
                 int
