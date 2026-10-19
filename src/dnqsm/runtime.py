@@ -53,6 +53,8 @@ def load_trained_model(
     if saved.get("version") != CHECKPOINT_VERSION:
         raise ValueError("Unsupported DN-QSM checkpoint version")
     config = dict(saved["model_config"])
+    # Historical checkpoints were trained with a zeroed exterior field.
+    config.setdefault("full_grid_field", False)
     config["features"] = tuple(config["features"])
     model = DNQSM(ModelConfig(**config)).to(device)
     model.load_state_dict(saved["model"])

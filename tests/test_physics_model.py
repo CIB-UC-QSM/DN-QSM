@@ -112,15 +112,14 @@ class PhysicsAndModelTests(unittest.TestCase):
         local_gt, chi_gt = torch.zeros_like(chi), torch.ones_like(chi) * 0.01
         weights = LossWeights(2, 3, 4)
         loss, terms = reconstruction_loss(
-            prediction, local_gt, chi_gt, mask, dipole, weights
+            prediction, local_gt, chi_gt, mask, dipole, weights, normalization=None
         )
-        self.assertEqual(set(terms), {"forward", "physics", "local", "chi"})
+        self.assertEqual(
+            set(terms), {"forward", "physics", "local", "chi", "extension"}
+        )
         torch.testing.assert_close(
             loss,
-            2 * terms["forward"]
-            + 3 * terms["local"]
-            + 4 * terms["chi"]
-            + terms["physics"],
+            sum(getattr(weights, name) * value for name, value in terms.items()),
         )
         expected = masked_mean(
             (apply_dipole(chi, dipole) - local).square(), mask
@@ -141,7 +140,9 @@ class PhysicsAndModelTests(unittest.TestCase):
         # consistency penalty, while clean-field physics still gives gradients.
         local = apply_dipole(chi.detach(), dipole).requires_grad_()
         prediction = Reconstruction(local, chi, chi * 0, chi)
-        _, terms = reconstruction_loss(prediction, clean, clean, mask, dipole)
+        _, terms = reconstruction_loss(
+            prediction, clean, clean, mask, dipole, normalization=None
+        )
         self.assertEqual(float(terms["forward"].detach()), 0)
         torch.testing.assert_close(
             terms["physics"],

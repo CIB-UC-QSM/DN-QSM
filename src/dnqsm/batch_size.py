@@ -13,18 +13,26 @@ from pathlib import Path
 import torch
 
 from . import evaluation
-from .data import BalancedSourceSampler, ShapeFieldSynthesizer, shape_groups
+from .data import (
+    BalancedSourceSampler,
+    ShapeFieldSynthesizer,
+    TrainingVolumes,
+    shape_groups,
+)
 from .logging import _pyplot, write_json
-from .losses import LossWeights
+from .losses import LOSS_VERSION
 from .memory import ProcessMemoryMonitor
 from .model import DNQSM
 from .runtime import configure_memory_budget, require_device
 from .training import (
     TrainConfig,
     _loader,
+    background_options,
     backward_batch,
     build_datasets,
     model_config,
+    normalization_config,
+    training_weights,
     validate,
 )
 
@@ -76,6 +84,10 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
         training_repeats=3,
         crop_probability=config.crop_probability,
         crop_resize=config.crop_resize,
+        loss_version=LOSS_VERSION,
+        normalize_loss=config.normalize_loss,
+        background_profile=config.background_profile,
+        gradient_every=config.gradient_every,
     )
     started = time.perf_counter()
     try:
@@ -91,20 +103,23 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
             sampler = BalancedSourceSampler(
                 training.records, config.synthetic_fraction, config.seed
             )
-            weights = LossWeights(
-                config.lambda_forward,
-                config.lambda_local,
-                config.lambda_chi,
-                config.lambda_physics,
-            )
+            weights = training_weights(config)
             tested_shapes = set()
 
-            def step_batch(batch, title=None):
+            def step_batch(batch, title=None, *, diagnostics=False):
                 groups = shape_groups(batch)
                 tested_shapes.update(tuple(group["chi"].shape[-3:]) for group in groups)
                 count = sum(group["chi"].shape[0] for group in groups)
                 _, figure, _, _ = backward_batch(
-                    model, batch, synthesizer, device, weights, config, count, title
+                    model,
+                    batch,
+                    synthesizer,
+                    device,
+                    weights,
+                    config,
+                    count,
+                    title,
+                    gradient_diagnostics=bool(diagnostics and config.gradient_every),
                 )
                 if figure is not None:
                     _pyplot().close(figure)
@@ -121,7 +136,13 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
             training.crop_probability = 0.0
             loader = _loader(training, replace(config, num_workers=0), sampler)
             for index, batch in enumerate(islice(loader, 3)):
-                step_batch(batch, "Batch memory probe" if index == 0 else None)
+                # Probe gradients with Adam moments already resident. A fresh
+                # process can fit a larger batch only before optimizer init.
+                step_batch(
+                    batch,
+                    "Batch memory probe" if index == 0 else None,
+                    diagnostics=index == 1,
+                )
                 print(f"batch={config.batch_size} repeat={index + 1}/3", flush=True)
             del loader, batch
             if config.crop_probability:
@@ -174,6 +195,29 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
                 device,
                 weights,
                 config.bf16,
+                normalization=normalization_config(config),
+                synthesis_options=background_options(config),
+            )
+            if figure is not None:
+                _pyplot().close(figure)
+            stress = TrainingVolumes(
+                validation.records,
+                config.cache_dir,
+                validation=True,
+                views=config.val_views,
+                seed=config.seed + 100000,
+            )
+            _, figure = validate(
+                model,
+                _loader(
+                    stress, replace(config, num_workers=0), sampler=validation_indices
+                ),
+                synthesizer,
+                device,
+                weights,
+                config.bf16,
+                normalization=normalization_config(config),
+                synthesis_options=dict(background_mode="legacy"),
             )
             if figure is not None:
                 _pyplot().close(figure)

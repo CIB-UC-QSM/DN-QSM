@@ -5,15 +5,16 @@ import json
 import math
 import signal
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
 import torch
 
+from .diagnostics import loss_gradient_metrics
 from .evaluation import evaluate_checkpoint, load_cosmos_case
 from .logging import RunLogger, reconstruction_figure, write_json
-from .losses import LOSS_VERSION, LossWeights, reconstruction_loss
+from .losses import LOSS_VERSION, LossNormalization, LossWeights, reconstruction_loss
 from .memory import ProcessMemoryMonitor
 from .model import DNQSM, ModelConfig
 from .paths import RUNS_DIR
@@ -38,11 +39,12 @@ class OverfitConfig:
     steps: int = 250
     learning_rate: float = 1e-3
     min_lr_factor: float = 0.05
-    grad_clip: float = 1.0
+    grad_clip: float = 10.0
     features: tuple[int, ...] = (54, 108, 216, 432, 864)
     threshold: float = 0.1
     checkpoint_blocks: bool = True
     residual_filter: bool = True
+    full_grid_field: bool = True
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -51,10 +53,16 @@ class OverfitConfig:
     stop_on_pass: bool = True
     target_nrmse: float = 10.0
     target_loss_ratio: float = 0.2
+    normalize_loss: bool = True
+    chi_loss_floor: float = 1e-4
+    field_loss_floor: float = 1e-4
     lambda_forward: float = 1.0
-    lambda_local: float = 1.0
+    lambda_local: float = 1.5
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
+    lambda_extension: float = 1.0
+    physics_warmup_steps: int = 0
+    gradient_every: int = 50
     comet: bool = False
     comet_env_file: str | None = None
     comet_project: str = "dn-qsm"
@@ -95,10 +103,22 @@ class OverfitConfig:
             self.threshold,
             checkpoint_blocks=self.checkpoint_blocks,
             residual_filter=self.residual_filter,
+            full_grid_field=self.full_grid_field,
         )
         LossWeights(
-            self.lambda_forward, self.lambda_local, self.lambda_chi, self.lambda_physics
+            self.lambda_forward,
+            self.lambda_local,
+            self.lambda_chi,
+            self.lambda_physics,
+            self.lambda_extension,
         )
+        LossNormalization(self.chi_loss_floor, self.field_loss_floor)
+        if min(self.physics_warmup_steps, self.gradient_every) < 0:
+            raise ValueError(
+                "Warmup and gradient logging intervals must be nonnegative"
+            )
+        if not self.full_grid_field and self.lambda_extension:
+            raise ValueError("Masked-field ablations require --lambda-extension 0")
 
 
 def passes_sanity(metrics: dict, initial_loss: float, config: OverfitConfig) -> bool:
@@ -156,6 +176,22 @@ def _run_overfit(
             raise ValueError("Resume must use the same fixed COSMOS simulation")
         if start_step >= config.steps:
             raise ValueError("The requested update budget is already exhausted")
+        for name in (
+            "full_grid_field",
+            "normalize_loss",
+            "chi_loss_floor",
+            "field_loss_floor",
+            "lambda_forward",
+            "lambda_local",
+            "lambda_chi",
+            "lambda_physics",
+            "lambda_extension",
+            "physics_warmup_steps",
+        ):
+            if getattr(config, name) != resumed["config"].get(name):
+                raise ValueError(
+                    f"Resume must preserve objective configuration: {name}"
+                )
     directory = (
         Path(config.resume).resolve().parent
         if resumed
@@ -198,12 +234,14 @@ def _run_overfit(
             local=case.local,
         ).items()
     }
+    data["local_full"] = apply_dipole(data["chi"] * data["mask"], data["dipole"])
     model = DNQSM(
         ModelConfig(
             tuple(config.features),
             config.threshold,
             checkpoint_blocks=config.checkpoint_blocks,
             residual_filter=config.residual_filter,
+            full_grid_field=config.full_grid_field,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -278,6 +316,12 @@ def _run_overfit(
         config.lambda_local,
         config.lambda_chi,
         config.lambda_physics,
+        config.lambda_extension,
+    )
+    normalization = (
+        LossNormalization(config.chi_loss_floor, config.field_loss_floor)
+        if config.normalize_loss
+        else None
     )
     stopped = False
     handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}
@@ -316,6 +360,8 @@ def _run_overfit(
             data["mask"],
             data["dipole"],
             weights,
+            normalization=normalization,
+            local_full_target=data["local_full"],
         )
         metrics = {
             "loss": float(loss),
@@ -365,16 +411,34 @@ def _run_overfit(
                 optimizer.zero_grad(set_to_none=True)
                 with autocast_context(device, config.bf16):
                     output = model(data["phase"], data["mask"], data["dipole"])
-                loss, _ = reconstruction_loss(
+                active_weights = (
+                    replace(
+                        weights,
+                        physics=weights.physics
+                        * min(1.0, step / config.physics_warmup_steps),
+                    )
+                    if config.physics_warmup_steps
+                    else weights
+                )
+                loss, terms = reconstruction_loss(
                     output,
                     data["local"],
                     data["chi"],
                     data["mask"],
                     data["dipole"],
-                    weights,
+                    active_weights,
+                    normalization=normalization,
+                    local_full_target=data["local_full"],
                 )
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError("Nonfinite single-case training loss")
+                if config.gradient_every and step % config.gradient_every == 0:
+                    logger.log(
+                        "overfit_gradients",
+                        step,
+                        0,
+                        **loss_gradient_metrics(model, terms, active_weights),
+                    )
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip, error_if_nonfinite=True
@@ -382,7 +446,7 @@ def _run_overfit(
                 optimizer.step()
                 scheduler.step()
                 monitor.check()
-                del output, loss
+                del output, loss, terms
             if (
                 step != start_step
                 and step % config.log_every

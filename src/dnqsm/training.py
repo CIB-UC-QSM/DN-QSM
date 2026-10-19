@@ -8,7 +8,7 @@ import random
 import signal
 import time
 from collections import defaultdict
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -26,17 +26,19 @@ from .data import (
     shape_groups,
     training_records,
 )
+from .diagnostics import loss_gradient_metrics, quality_totals, summarize_quality
 from .logging import RunLogger, reconstruction_figure, write_json
 from .losses import (
     LOSS_VERSION,
+    LossNormalization,
     LossWeights,
+    normalize_loss_terms,
     per_sample_loss_terms,
-    reconstruction_loss,
 )
 from .memory import ProcessMemoryMonitor
 from .model import DNQSM, ModelConfig
 from .paths import RUNS_DIR, TRAINING_CACHE_DIR, TRAINING_DATA_DIR
-from .physics import masked_nrmse
+from .physics import apply_dipole, masked_nrmse
 from .runtime import (
     CHECKPOINT_VERSION,
     atomic_save,
@@ -69,7 +71,7 @@ class TrainConfig:
     weight_decay: float = 1e-4
     warmup_epochs: int = 3
     min_lr_factor: float = 0.05
-    grad_clip: float = 1.0
+    grad_clip: float = 10.0
     val_fraction: float = 0.1
     val_views: int = 3
     synthetic_fraction: float = 0.25
@@ -81,10 +83,23 @@ class TrainConfig:
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = True
     residual_filter: bool = False
+    full_grid_field: bool = True
+    normalize_loss: bool = True
+    chi_loss_floor: float = 1e-4
+    field_loss_floor: float = 1e-4
     lambda_forward: float = 1.0
-    lambda_local: float = 1.0
+    lambda_local: float = 1.5
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
+    lambda_extension: float = 1.0
+    physics_warmup_epochs: int = 0
+    background_profile: str = "mixture"
+    background_curriculum_epochs: int = 5
+    strong_min_ratio: float = 0.001
+    strong_probability: float = 0.25
+    clean_probability: float = 0.15
+    weak_probability: float = 0.1
+    gradient_every: int = 100
     bf16: bool = True
     comet: bool = False
     comet_env_file: str | None = None
@@ -125,6 +140,9 @@ class TrainConfig:
                 self.max_val_subjects,
                 self.sim2_pad,
                 self.external_eval_every,
+                self.physics_warmup_epochs,
+                self.background_curriculum_epochs,
+                self.gradient_every,
             )
             < 0
         ):
@@ -154,10 +172,34 @@ class TrainConfig:
             self.scale_floor,
             self.checkpoint_blocks,
             self.residual_filter,
+            self.full_grid_field,
         )
         LossWeights(
-            self.lambda_forward, self.lambda_local, self.lambda_chi, self.lambda_physics
+            self.lambda_forward,
+            self.lambda_local,
+            self.lambda_chi,
+            self.lambda_physics,
+            self.lambda_extension,
         )
+        LossNormalization(self.chi_loss_floor, self.field_loss_floor)
+        if (
+            self.background_profile not in ("mixture", "ratio", "legacy")
+            or not math.isfinite(self.strong_min_ratio)
+            or not 0 < self.strong_min_ratio <= 0.03
+            or any(
+                not 0 <= p <= 1
+                for p in (
+                    self.strong_probability,
+                    self.clean_probability,
+                    self.weak_probability,
+                )
+            )
+            or self.strong_probability + self.clean_probability + self.weak_probability
+            > 1
+        ):
+            raise ValueError("Invalid background sampling configuration")
+        if not self.full_grid_field and self.lambda_extension:
+            raise ValueError("Masked-field ablations require --lambda-extension 0")
         if self.resume and self.init_checkpoint:
             raise ValueError("Choose --resume or --init-checkpoint, not both")
 
@@ -169,6 +211,41 @@ def model_config(config: TrainConfig) -> ModelConfig:
         config.scale_floor,
         config.checkpoint_blocks,
         config.residual_filter,
+        config.full_grid_field,
+    )
+
+
+def normalization_config(config):
+    return (
+        LossNormalization(config.chi_loss_floor, config.field_loss_floor)
+        if config.normalize_loss
+        else None
+    )
+
+
+def training_weights(config, step=0, warmup_steps=0):
+    weights = LossWeights(
+        config.lambda_forward,
+        config.lambda_local,
+        config.lambda_chi,
+        config.lambda_physics,
+        config.lambda_extension,
+    )
+    if warmup_steps:
+        weights = replace(
+            weights, physics=weights.physics * min(1.0, (step + 1) / warmup_steps)
+        )
+    return weights
+
+
+def background_options(config, progress=1.0):
+    return dict(
+        background_mode=config.background_profile,
+        curriculum_progress=progress,
+        strong_min_ratio=config.strong_min_ratio,
+        strong_probability=config.strong_probability,
+        clean_probability=config.clean_probability,
+        weak_probability=config.weak_probability,
     )
 
 
@@ -219,13 +296,14 @@ def build_datasets(config: TrainConfig, directory: Path):
         crop_probability=config.crop_probability,
         crop_resize=config.crop_resize,
     )
-    # Match wh_net's held-out fixed legacy-scale validation views.
+    # Fixed held-out views follow training's susceptibility distribution.
     validation_set = TrainingVolumes(
         validation,
         config.cache_dir,
         validation=True,
         views=config.val_views,
         seed=config.seed + 100000,
+        chi_scale_mode="rms_mixture",
     )
     shape = tuple(training_set[0]["original_shape"].tolist())
     return training_set, validation_set, shape
@@ -249,53 +327,123 @@ def _loader(dataset, config: TrainConfig, sampler=None, epoch: int = 0):
 
 
 def backward_batch(
-    model, batch, synthesizer, device, weights, config, group_samples, figure_title=None
+    model,
+    batch,
+    synthesizer,
+    device,
+    weights,
+    config,
+    group_samples,
+    figure_title=None,
+    *,
+    gradient_diagnostics=False,
+    background_progress=1.0,
 ):
     """Accumulate equally weighted samples across their model-input grids."""
     totals = defaultdict(float)
     figure = None
     samples = cropped = 0
     for shaped_batch in shape_groups(batch):
-        data = synthesizer(shaped_batch, background_mode="ratio")
+        data = synthesizer(
+            shaped_batch, **background_options(config, background_progress)
+        )
         count = data["chi"].shape[0]
         fraction = count / group_samples
         with autocast_context(device, config.bf16):
             output = model(data["phase"], data["mask"], data["dipole"])
-        loss, terms = reconstruction_loss(
-            output, data["local"], data["chi"], data["mask"], data["dipole"], weights
+        predicted_field = apply_dipole(output.chi, data["dipole"])
+        raw = per_sample_loss_terms(
+            output,
+            data["local"],
+            data["chi"],
+            data["mask"],
+            data["dipole"],
+            local_full_target=data["local_full"],
+            predicted_field=predicted_field,
         )
+        terms = {
+            name: value.mean()
+            for name, value in normalize_loss_terms(
+                raw,
+                data["local"],
+                data["chi"],
+                data["mask"],
+                normalization_config(config),
+            ).items()
+        }
+        loss = sum(getattr(weights, name) * value for name, value in terms.items())
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Nonfinite training loss")
+        if gradient_diagnostics:
+            totals.update(loss_gradient_metrics(model, terms, weights))
+            totals["gradient_diagnostic_samples"] = count
+            gradient_diagnostics = False
         (loss * fraction).backward()
         for name, value in dict(loss=loss, **terms).items():
             totals[name] += float(value.detach()) * fraction
+        for name, value in raw.items():
+            totals["raw_" + name] += float(value.detach().mean()) * fraction
+        for name, value in quality_totals(
+            output, data, predicted_field=predicted_field
+        ).items():
+            totals[name] += value
         if figure_title is not None and figure is None:
             figure = reconstruction_figure(data, output, figure_title)
         samples += count
         if "crop_applied" in shaped_batch:
             cropped += int(shaped_batch["crop_applied"].sum())
-        del data, output, loss, terms, value
+        del data, output, loss, terms, raw, value, predicted_field
     return totals, figure, samples, cropped
 
 
 @torch.no_grad()
-def validate(model, loader, synthesizer, device, weights, bf16: bool):
+def validate(
+    model,
+    loader,
+    synthesizer,
+    device,
+    weights,
+    bf16: bool,
+    *,
+    normalization=LossNormalization(),
+    synthesis_options=None,
+):
     model.eval()
     subjects = defaultdict(list)
     first = None
+    quality = defaultdict(float)
     for batch in loader:
-        data = synthesizer(batch, background_mode="legacy")
+        data = synthesizer(
+            batch, **(synthesis_options or dict(background_mode="mixture"))
+        )
         with autocast_context(device, bf16):
             output = model(data["phase"], data["mask"], data["dipole"])
+        predicted_field = apply_dipole(output.chi, data["dipole"])
+        raw = per_sample_loss_terms(
+            output,
+            data["local"],
+            data["chi"],
+            data["mask"],
+            data["dipole"],
+            local_full_target=data["local_full"],
+            predicted_field=predicted_field,
+        )
         per_sample = {
             name: values.flatten()
-            for name, values in per_sample_loss_terms(
-                output, data["local"], data["chi"], data["mask"], data["dipole"]
+            for name, values in normalize_loss_terms(
+                raw, data["local"], data["chi"], data["mask"], normalization
             ).items()
         }
         per_sample["loss"] = sum(
             getattr(weights, name) * values for name, values in per_sample.items()
         )
+        per_sample.update(
+            {"raw_" + name: value.flatten() for name, value in raw.items()}
+        )
+        for name, value in quality_totals(
+            output, data, predicted_field=predicted_field
+        ).items():
+            quality[name] += value
         chi_errors = masked_nrmse(output.chi, data["chi"], data["mask"])
         local_errors = masked_nrmse(output.local_field, data["local"], data["mask"])
         tkd_errors = masked_nrmse(output.tkd, data["chi"], data["mask"])
@@ -316,22 +464,20 @@ def validate(model, loader, synthesizer, device, weights, bf16: bool):
                 data, output, "Held-out validation (physical units)"
             )
     result = {}
-    for name in (
-        "chi_nrmse",
-        "local_nrmse",
-        "tkd_nrmse",
-        "forward",
-        "physics",
-        "local",
-        "chi",
-        "loss",
-    ):
+    for name in next(iter(subjects.values()))[0]:
         means = [
             float(np.mean([row[name] for row in rows if row[name] is not None]))
             for rows in subjects.values()
             if any(row[name] is not None for row in rows)
         ]
         result[name] = float(np.mean(means)) if means else None
+    result.update(
+        {
+            key: value
+            for key, value in summarize_quality(quality).items()
+            if key.startswith("bucket_") or key == "physics_nrmse"
+        }
+    )
     return result, first
 
 
@@ -406,6 +552,7 @@ def run_training(config: TrainConfig) -> Path:
             "sim2_pad",
             "log_every",
             "save_every_steps",
+            "gradient_every",
         }
         current = json.loads(json.dumps(asdict(config)))
         previous = json.loads(json.dumps(resume["config"]))
@@ -430,6 +577,14 @@ def run_training(config: TrainConfig) -> Path:
         directory.mkdir(parents=True, exist_ok=False)
     config.run_dir = str(directory.resolve())
     training_set, validation_set, shape = build_datasets(config, directory)
+    stress_set = TrainingVolumes(
+        validation_set.records,
+        config.cache_dir,
+        validation=True,
+        views=config.val_views,
+        seed=config.seed + 100000,
+        chi_scale_mode="legacy",
+    )
     write_json(directory / "config.json", asdict(config))
     write_json(directory / "status.json", dict(status="running", device=str(device)))
     model = DNQSM(model_config(config)).to(device)
@@ -443,12 +598,7 @@ def run_training(config: TrainConfig) -> Path:
         weight_decay=config.weight_decay,
         foreach=False,
     )
-    weights = LossWeights(
-        config.lambda_forward,
-        config.lambda_local,
-        config.lambda_chi,
-        config.lambda_physics,
-    )
+    weights = training_weights(config)
     synthesizer = ShapeFieldSynthesizer(device)
     sampler = BalancedSourceSampler(
         training_set.records, config.synthetic_fraction, config.seed
@@ -457,6 +607,7 @@ def run_training(config: TrainConfig) -> Path:
     updates_per_epoch = math.ceil(batches_per_epoch / config.accumulation_steps)
     total_steps = updates_per_epoch * config.epochs
     warmup_steps = min(config.warmup_epochs * updates_per_epoch, total_steps)
+    physics_warmup_steps = config.physics_warmup_epochs * updates_per_epoch
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
         lambda s: learning_rate_multiplier(
@@ -465,6 +616,7 @@ def run_training(config: TrainConfig) -> Path:
     )
     epoch, next_batch, step, best = 0, 0, 0, float("inf")
     epoch_samples = epoch_cropped = 0
+    epoch_clipped = 0
     if resume:
         model.load_state_dict(resume["model"])
         optimizer.load_state_dict(resume["optimizer"])
@@ -475,6 +627,7 @@ def run_training(config: TrainConfig) -> Path:
         _restore_rng(resume["rng"])
         epoch_samples = resume.get("epoch_samples", 0)
         epoch_cropped = resume.get("epoch_cropped", 0)
+        epoch_clipped = resume.get("epoch_clipped", 0)
     is_resuming = resume is not None
     del resume
     logger = None
@@ -505,7 +658,9 @@ def run_training(config: TrainConfig) -> Path:
             best=best,
             epoch_samples=epoch_samples,
             epoch_cropped=epoch_cropped,
+            epoch_clipped=epoch_clipped,
             physics_grid_version=2,
+            validation_profile="matched",
         )
         atomic_save(payload, directory / "model_last.pt")
         atomic_save(
@@ -544,6 +699,9 @@ def run_training(config: TrainConfig) -> Path:
             crop_resize=config.crop_resize,
             external_eval_every=config.external_eval_every,
             physics_grid_version=2,
+            validation_profile="matched",
+            normalize_loss=config.normalize_loss,
+            full_grid_field=config.full_grid_field,
         )
         while epoch < config.epochs:
             if config.max_steps and step >= config.max_steps:
@@ -563,6 +721,11 @@ def run_training(config: TrainConfig) -> Path:
             group_terms = defaultdict(float)
             started = time.perf_counter()
             train_figure = None
+            background_progress = (
+                min(1.0, (epoch + 1) / config.background_curriculum_epochs)
+                if config.background_curriculum_epochs
+                else 1.0
+            )
             for batch in loader:
                 group_end = min(
                     group_start + config.accumulation_steps, batches_per_epoch
@@ -577,10 +740,16 @@ def run_training(config: TrainConfig) -> Path:
                     batch,
                     synthesizer,
                     device,
-                    weights,
+                    training_weights(config, step, physics_warmup_steps),
                     config,
                     group_samples,
                     f"Training epoch {epoch + 1}" if train_figure is None else None,
+                    gradient_diagnostics=bool(
+                        config.gradient_every
+                        and group_start == next_batch
+                        and (step == 0 or (step + 1) % config.gradient_every == 0)
+                    ),
+                    background_progress=background_progress,
                 )
                 for name, value in terms.items():
                     group_terms[name] += value
@@ -594,12 +763,17 @@ def run_training(config: TrainConfig) -> Path:
                 norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), config.grad_clip, error_if_nonfinite=True
                 )
+                clipped = int(float(norm) > config.grad_clip)
+                epoch_clipped += clipped
                 lr = optimizer.param_groups[0]["lr"]
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 step += 1
-                if step % config.log_every == 0:
+                if (
+                    step % config.log_every == 0
+                    or "gradient_diagnostic_samples" in group_terms
+                ):
                     memory = (
                         {}
                         if device.type != "cuda"
@@ -618,9 +792,15 @@ def run_training(config: TrainConfig) -> Path:
                         "train",
                         step,
                         epoch + 1,
-                        **group_terms,
+                        **summarize_quality(group_terms),
                         learning_rate=lr,
                         gradient_norm=float(norm),
+                        gradient_clipped=clipped,
+                        gradient_clip_threshold=config.grad_clip,
+                        active_physics_weight=training_weights(
+                            config, step - 1, physics_warmup_steps
+                        ).physics,
+                        background_curriculum_progress=background_progress,
                         seconds=time.perf_counter() - started,
                         **memory,
                     )
@@ -653,6 +833,9 @@ def run_training(config: TrainConfig) -> Path:
                         ),
                     )
                     return directory
+            # All epoch updates are durable before either validation suite or
+            # external evaluation. Resume may repeat metrics, never updates.
+            save()
             if train_figure is not None:
                 logger.figure(train_figure, "train", epoch + 1, epoch + 1)
             logger.log(
@@ -663,6 +846,15 @@ def run_training(config: TrainConfig) -> Path:
                 cropped_samples=epoch_cropped,
                 crop_fraction=epoch_cropped / max(1, epoch_samples),
             )
+            logger.log(
+                "optimization",
+                step,
+                epoch + 1,
+                comet_step=epoch + 1,
+                clipped_updates=epoch_clipped,
+                clipping_fraction=epoch_clipped / updates_per_epoch,
+                background_curriculum_progress=background_progress,
+            )
             metrics, figure = validate(
                 model,
                 _loader(validation_set, config),
@@ -670,10 +862,31 @@ def run_training(config: TrainConfig) -> Path:
                 device,
                 weights,
                 config.bf16,
+                normalization=normalization_config(config),
+                synthesis_options=background_options(config),
             )
             logger.log("validation", step, epoch + 1, comet_step=epoch + 1, **metrics)
             if figure is not None:
                 logger.figure(figure, "validation", epoch + 1, epoch + 1)
+            stress_metrics, stress_figure = validate(
+                model,
+                _loader(stress_set, config),
+                synthesizer,
+                device,
+                weights,
+                config.bf16,
+                normalization=normalization_config(config),
+                synthesis_options=dict(background_mode="legacy"),
+            )
+            logger.log(
+                "validation_stress",
+                step,
+                epoch + 1,
+                comet_step=epoch + 1,
+                **stress_metrics,
+            )
+            if stress_figure is not None:
+                logger.figure(stress_figure, "validation_stress", epoch + 1, epoch + 1)
             if metrics["chi_nrmse"] is None:
                 raise ValueError(
                     "All validation susceptibility references have zero energy"
@@ -690,6 +903,7 @@ def run_training(config: TrainConfig) -> Path:
                         step=step,
                         epoch=epoch + 1,
                         best=best,
+                        validation_profile="matched",
                     ),
                     directory / "model_best.pt",
                 )
@@ -697,9 +911,6 @@ def run_training(config: TrainConfig) -> Path:
                 config.external_eval_every
                 and (epoch + 1) % config.external_eval_every == 0
             ):
-                # An evaluation failure can resume this boundary without
-                # replaying optimizer updates from the completed epoch.
-                save()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
                 evaluation.evaluate_training_epoch(
@@ -715,6 +926,7 @@ def run_training(config: TrainConfig) -> Path:
             epoch += 1
             next_batch = 0
             epoch_samples = epoch_cropped = 0
+            epoch_clipped = 0
             save()
             write_json(
                 directory / "status.json",
@@ -779,6 +991,9 @@ def run_training(config: TrainConfig) -> Path:
 
 def parse_args(argv: list[str] | None = None) -> TrainConfig:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config", type=Path, help="JSON training configuration; CLI flags override it"
+    )
     defaults = TrainConfig()
     integer_fields = {
         f.name for f in fields(defaults) if type(getattr(defaults, f.name)) is int
@@ -804,6 +1019,18 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         parser.add_argument("--" + name.replace("_", "-"), **kwargs)
     overrides = vars(parser.parse_args(argv))
     values = asdict(defaults)
+    config_file = overrides.pop("config", None)
+    if config_file:
+        if overrides.get("resume"):
+            parser.error(
+                "Use --config for a new experiment or --resume for exact continuation"
+            )
+        configured = json.loads(config_file.read_text())
+        if not isinstance(configured, dict) or configured.keys() - values.keys():
+            parser.error("Training JSON must contain only TrainConfig field names")
+        if configured.get("resume"):
+            parser.error("Use --resume for exact continuation, without a JSON profile")
+        values.update(configured)
     if overrides.get("resume"):
         saved = torch.load(
             overrides["resume"], weights_only=True, map_location="cpu", mmap=True

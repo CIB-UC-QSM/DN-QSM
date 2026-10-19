@@ -36,10 +36,11 @@ The large overfit profile below uses five wider levels. All use InstanceNorm/CEL
 double-convolution blocks and trilinear upsampling. Inputs are normalized by
 masked RMS, and outputs are rescaled to ppm.
 
-1. A U-Net maps the masked total field to a masked clean local field `local`.
-   The large overfit profile uses a residual filter: `local = mask * (field +
-   scale * UNet(field/scale))`. `--no-residual-filter` selects the original direct
-   output. Checkpoints preserve this choice; older checkpoints use direct output.
+1. A U-Net maps the masked total field to a **full-grid** clean local field
+   `local`, including its exterior extension. Residual filtering computes
+   `local = field + scale * UNet(field/scale)`; `--no-residual-filter` selects
+   direct output. `--no-full-grid-field --lambda-extension 0` provides a masked
+   field ablation. Historical checkpoints retain their masked-field behavior.
 2. TKD computes `chi0 = F^-1(B_tau * F(local))`, where `B_tau=1/D` for
    `abs(D)>tau` and zero otherwise. The default threshold is `tau=0.1`.
 3. A second U-Net predicts a susceptibility residual from `chi0`. The output is
@@ -52,25 +53,39 @@ with a hard-cutoff inverse. The correction lies in the null space of the
 dipole field. A fixed threshold does not establish the paper's asymptotic
 convergence claims for this trained pipeline.
 
-The final susceptibility and correction remain unmasked on the FFT grid.
-Spatial masking would change their Fourier support. Use the mask for metrics
-and visualization; masked exports are provided separately.
+Local field, susceptibility, and correction remain unmasked on the FFT grid.
+Zeroing the local field exterior would change retained-frequency information
+before inversion; the projected correction cannot change those coefficients.
+Use the mask for ROI metrics and visualization; masked exports are separate.
 
-Four terms form the loss:
+The four ROI penalties are dimensionless and normalized independently per sample.
+`s_chi` and `s_b` are detached ground-truth susceptibility and clean-local-field
+masked RMS, clamped by `--chi-loss-floor` and `--field-loss-floor` (both `1e-4`
+ppm). Neither the total field nor a prediction sets these scales:
 
 ```text
-loss = lambda_forward * masked_MSE(A(chi), local)
-     + lambda_physics * masked_MSE(A(chi), local_gt)
-     + lambda_local   * masked_MAE(local, local_gt)
-     + lambda_chi     * masked_MAE(chi, chi_gt)
+loss = lambda_forward * masked_MSE(A(chi), local)    / s_b**2
+     + lambda_physics * masked_MSE(A(chi), local_gt) / s_b**2
+     + lambda_local   * masked_MAE(local, local_gt)  / s_b
+     + lambda_chi     * masked_MAE(chi, chi_gt)      / s_chi
+     + lambda_extension * exterior_MAE(local, local_full_gt) / s_b
 ```
 
-All weights default to one and are independently configurable. Reductions
-average masked voxels per sample, then samples. `lambda_forward` compares with
+Default weights are `local=1.5` and `chi=physics=forward=extension=1.0`.
+The predicted-local/clean-local penalty therefore has a coefficient 50% higher
+than every other normalized penalty. The fifth term
+supervises the exterior using the full simulated field `A(mask*chi_gt)`;
+an empty exterior contributes zero. Reductions average voxels per sample, then
+samples. `--no-normalize-loss` provides a raw-loss ablation. `lambda_forward` compares with
 the predicted **pre-TKD field**, with its gradient intact. `lambda_physics`
 compares directly with the **ground-truth clean local field**, independently
 penalizing a susceptibility/filter pair that agrees on the wrong field.
 Physics and losses stay FP32 even when eligible GPU convolutions use BF16.
+The filtering precision policy is unchanged: the CNN and its output head still
+use BF16 under CUDA autocast. Physics-weight warmup is disabled by default so
+the 1.5:1 coefficient ratio holds from the first update. Optional
+`--physics-warmup-epochs` ramps only the physics term; validation always uses
+the final coefficients.
 
 ```python
 from dnqsm.training import load_trained_model
@@ -92,11 +107,22 @@ The loader groups all augmentations of a source subject before the 90/10 split.
 Synthetic subjects (`synthetic:` IDs) enter training only. Each epoch draws 75%
 original and 25% synthetic samples, when both cohorts exist. Training uses the
 reference's physical-unit susceptibility RMS mixture, flips/permutations,
-exterior-source backgrounds with local/background RMS ratios of 0.03–3, and
-reliability-dependent noise with clean-field RMS/noise RMS SNR of 40–100.
+exterior-source backgrounds, and reliability-dependent noise with clean-field
+RMS/noise RMS SNR of 40–100. The default background mixture contains 15% clean
+(no background), 10% weak backgrounds (local/background RMS ratio 3–100),
+25% strong backgrounds (ratio 0.001–0.03), and 50% typical backgrounds (0.03–3).
+Over five epochs, `--background-curriculum-epochs` ramps the strong fraction
+and lowers its minimum ratio. Unused strong probability initially becomes typical
+background probability. Fractions and `--strong-min-ratio` are configurable;
+`--background-profile ratio` and `legacy` provide ablations. At fixed sample
+seeds, RNG streams are independent of batch construction; strongly amplified
+backgrounds can expose small FP32 FFT rounding differences across batch sizes.
 The clean local target is recomputed from susceptibility; no sparse impulses
-are applied. Held-out subjects use three fixed legacy-scale views, matching
-the maintained reference validation protocol.
+are applied. Held-out subjects have three fixed views in each of two suites:
+`validation` uses the training susceptibility/background distribution at its
+fully developed mixture and selects the best checkpoint. `validation_stress`
+retains the legacy susceptibility scales and unrescaled strong backgrounds.
+Both remain subject-disjoint from training, uncropped, and fixed across epochs.
 
 `--crop-probability 0.2` additionally selects 20% of training samples in
 expectation for a tight foreground-mask bounding-box crop. Selection is
@@ -126,7 +152,8 @@ uv run dnqsm-train --device cuda:0 --comet \
 
 The default run lasts 50 epochs, with batch size 1, accumulation over five
 batches, AdamW at `1e-4`, weight decay `1e-4`, three warmup epochs, cosine decay
-to `5e-6`, and gradient clipping at 1. CUDA convolutions use BF16 when supported.
+to `5e-6`, and gradient clipping at 10 for the normalized objective. CUDA
+convolutions use BF16 when supported.
 Activation checkpointing is enabled. Check GPU occupancy before a full run.
 `--cuda-memory-gb 12` sets an 11 GiB PyTorch allocator ceiling and reserves
 1 GiB for CUDA context/library allocations. Zero leaves the allocator unlimited.
@@ -146,7 +173,8 @@ This measures residual field filtering, BF16, and activation checkpointing on
 actual 160³ training volumes. `--config <json>` accepts a saved training config.
 Each candidate runs in an isolated process and includes synthesis, three
 uncropped forward/backward/Adam cycles with zero learning rate, crop/resize
-augmentation, partial training/validation batches, visualizations, and both external
+augmentation, gradient telemetry, partial training/matched/stress validation
+batches, visualizations, and both external
 evaluation cases. The search brackets the limit, checks the
 adjacent larger integer, and writes the chosen batch and all measured peaks to
 `summary.json`. It reserves 1 GiB outside the allocator within the requested
@@ -177,7 +205,7 @@ target applies to a full-size batch; interpolated crops now use that same size.
 Each new run creates `artifacts/runs/dnqsm_<timestamp>/` with configuration,
 subject split, JSONL metrics, central-slice images, and these checkpoints:
 
-- `model_best.pt`: model selected by mean held-out subject susceptibility NRMSE.
+- `model_best.pt`: model selected by matched held-out subject susceptibility NRMSE.
 - `model_last.pt`: most recent inference weights.
 - `training_last.pt`: model, optimizer, scheduler, RNG state, and resume cursor.
 
@@ -190,17 +218,34 @@ Resume preserves sampling, scheduling, architecture, and loss configuration:
 uv run dnqsm-train --resume artifacts/runs/<run>/training_last.pt --max-steps 0
 ```
 
-Exact resume also preserves crop interpolation. Checkpoints created before
-`crop_resize` existed retain native crops (`False`). Switching augmentation on
-an existing checkpoint requires a new run using `--init-checkpoint`; an explicit
-`--crop-resize` change during exact resume is rejected. New runs default to
-interpolating selected crops to 160³.
-
-Checkpoints record the loss version. The previous three-term experiment cannot
-silently resume with the new four-term objective. To reuse its network weights,
+Exact resume preserves interpolation, loss floors/weights and warmup, curriculum,
+full-grid field behavior, and validation definition. Checkpoints record loss
+version **3**. Earlier objectives cannot silently resume with the normalized
+objective and exterior supervision. For inference, historical checkpoints
+continue using their original masked-field behavior. To reuse their weights,
 start a separate experiment with `--init-checkpoint <old-run>/model_last.pt`;
 this resets the optimizer, scheduler, and training cursor and preserves the old
 run's history. Do not initialize a full run from COSMOS-overfitted weights.
+
+Portable corrective profiles are in `configs/corrective_200epochs.json` and
+`configs/corrective_ablation.json`. `--config` loads JSON for a new experiment;
+explicit CLI flags override it. Exact resume uses `--resume` without `--config`.
+The 200-epoch profile retains the 6.42M model and BF16, uses `3e-5` learning rate,
+20% crop/resize, and per-epoch COSMOS/sim2 evaluation. The ablation profile bounds
+training to 128 records and validation to eight subjects for five epochs.
+These profiles do not start or modify an existing run. Before a new long run,
+repeat the fixed-case overfit gate and compare short ablations across seeds.
+Re-profile VRAM: exterior targets and sampled gradient diagnostics are now included.
+
+```sh
+uv run python -m dnqsm.batch_size --config configs/corrective_200epochs.json \
+  --directory artifacts/capacity/corrective --expandable-segments
+uv run dnqsm-train --config configs/corrective_ablation.json \
+  --batch-size <selected_batch_size> --cuda-memory-gb <selected.cuda_memory_gib>
+uv run dnqsm-train --config configs/corrective_200epochs.json \
+  --batch-size <selected_batch_size> --cuda-memory-gb <selected.cuda_memory_gib> \
+  --comet-env-file ../wh_net/.env
+```
 
 `--max-steps` is a total update limit, including resumed updates; zero removes
 the limit. `--max-train-volumes` and `--max-val-subjects` bound diagnostics and
@@ -223,11 +268,22 @@ All susceptibility panels, including errors and TKD outputs, use `gray` and
 `[-0.1,0.1]` ppm. Figures show the three central planes and masked NRMSE in
 percent where a reference exists. Zero-energy references display `NRMSE=N/A`.
 
+Training logs normalized and `raw_*` penalties, susceptibility/local/forward
+NRMSE, background-bucket counts/errors, active physics weight, curriculum
+progress, clipping indicator, and epoch clipping fractions as native scalars.
+`--gradient-every 100` samples per-term gradient norms, weighted norms, and
+pairwise cosines separately for the filter and null network on the first shape
+group of the selected update. It preserves `.grad` and RNG state; zero disables
+the extra backward computations. Undefined bucket NRMSE values are omitted.
+Validation bucket metrics are sample-weighted; its overall NRMSE retains equal
+subject weighting. `validation` and `validation_stress` have distinct stable
+image series indexed by epoch, alongside COSMOS/sim2 series.
+
 ## Single-COSMOS overfitting check
 
 Keep full training stopped while checking whether the complete model can fit
 one fixed simulated total-field input and its clean local-field/susceptibility
-targets, using the same four-term objective:
+targets, using the same normalized objective and full-grid field supervision:
 
 ```sh
 uv run dnqsm-overfit-cosmos --device cuda:0 --cuda-memory-gb 27 --max-vram-gb 30 \
@@ -241,14 +297,20 @@ every update, with no augmentation or new noise. The large overfit default is
 250 updates with five encoder levels `[54,108,216,432,864]`, a 1,728-channel
 bottleneck, and **590,872,214 trainable parameters** across the two U-Nets.
 The former `[16,32,64]` model has 3,212,514 parameters. The sequential
-U-Net/TKD/projected-correction architecture and the four loss terms are retained;
+U-Net/TKD/projected-correction architecture uses the normalized ROI terms and
+full-grid exterior supervision;
 full-training defaults remain separately configurable.
 
 AdamW uses `1e-3`, zero weight decay, a memory-efficient per-tensor update
 (`foreach=False`), and cosine decay to 5% of the initial rate. BF16 convolutions,
-FP32 physics/losses, and activation checkpointing control memory. All four loss
+FP32 physics/losses, and activation checkpointing control memory. All five loss
 weights can be overridden independently. Use `--features 16 32 64 --steps 2000`
 for the former small-model experiment settings.
+Overfit physics-weight warmup is also disabled by default; optional
+`--physics-warmup-steps` enables a ramp.
+Its fit gate always measures the final fixed objective, so changing warmup
+weights cannot manufacture a passing loss reduction. `--gradient-every 50`
+records per-objective gradient norms/cosines without updating optimizer state.
 
 `--cuda-memory-gb` specifies a **GiB budget**, including a 1 GiB reserve outside
 the allocator. The 27 GiB setting therefore limits the PyTorch allocator to
@@ -350,6 +412,11 @@ binary masks, single-group batching, accumulation, native Comet scalar series
 and image progression across epochs,
 unchanged optimizer state during evaluation, figure limits, physical-unit
 evaluation, crop selection and geometry, and padding/affine restoration.
+Corrective-objective tests cover per-sample amplitude invariance, detached
+normalization scales, empty-exterior handling, full-grid inversion, historical
+checkpoint inference, unchanged BF16 output precision, mixture/curriculum
+sampling, gradient-diagnostic invariance, matched/stress scalar logging,
+checkpoint selection, and recovery from interrupted stress validation.
 
 Shared device, precision, memory-budget and checkpoint utilities live in
 `dnqsm.runtime`, allowing evaluation and overfit tools to run independently of

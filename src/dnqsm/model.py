@@ -18,6 +18,7 @@ class ModelConfig:
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = False
     residual_filter: bool = False
+    full_grid_field: bool = True
 
     def __post_init__(self) -> None:
         if not self.features or any(v < 1 for v in self.features):
@@ -121,7 +122,9 @@ class DNQSM(nn.Module):
         field = total_field.float() * mask
         scale = masked_rms(field, mask, self.config.scale_floor)
         filtered = self.filter(field / scale).float() * scale
-        local = (field + filtered if self.config.residual_filter else filtered) * mask
+        local = field + filtered if self.config.residual_filter else filtered
+        if not self.config.full_grid_field:
+            local = local * mask
         inverse, projection = cutoff_kernels(dipole, self.config.threshold)
         initial = apply_multiplier(local, inverse)
         chi_scale = masked_rms(initial, mask, self.config.scale_floor)

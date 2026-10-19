@@ -401,6 +401,7 @@ def _evaluate_case(
             checkpoint=str(Path(checkpoint).resolve()) if checkpoint else None,
             training_epoch=epoch,
             threshold=model.config.threshold,
+            full_grid_field=model.config.full_grid_field,
             grid_shape=list(phase.shape[-3:]),
             device=str(target),
             bf16=bool(

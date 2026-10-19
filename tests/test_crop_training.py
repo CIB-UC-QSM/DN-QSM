@@ -200,7 +200,7 @@ class CropTrainingTests(unittest.TestCase):
             )
             self.assertEqual((count, cropped_count), (3, 1))
             for sample in samples:
-                data = cache(default_collate([sample]), background_mode="ratio")
+                data = cache(default_collate([sample]), background_mode="mixture")
                 output = reference(data["phase"], data["mask"], data["dipole"])
                 loss, _ = reconstruction_loss(
                     output, data["local"], data["chi"], data["mask"], data["dipole"]

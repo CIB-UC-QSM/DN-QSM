@@ -5,6 +5,7 @@ noise and background never enter that target. No local impulse augmentation.
 """
 
 import json
+import math
 from collections import OrderedDict, defaultdict
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -290,9 +291,27 @@ class FieldSynthesizer(torch.nn.Module):
         batch,
         *,
         background_mode: str = "legacy",
+        curriculum_progress: float = 1.0,
+        strong_min_ratio: float = 0.001,
+        strong_probability: float = 0.25,
+        clean_probability: float = 0.15,
+        weak_probability: float = 0.1,
     ):
-        if background_mode not in ("legacy", "ratio"):
+        if background_mode not in ("legacy", "ratio", "mixture"):
             raise ValueError(f"Unknown background mode: {background_mode}")
+        if (
+            not math.isfinite(strong_min_ratio)
+            or not 0 < strong_min_ratio <= 0.03
+            or not 0 <= curriculum_progress <= 1
+            or any(
+                not 0 <= p <= 1
+                for p in (strong_probability, clean_probability, weak_probability)
+            )
+            or strong_probability + clean_probability + weak_probability > 1
+        ):
+            raise ValueError(
+                "Invalid background mixture probabilities, ratio, or curriculum"
+            )
         device = self.dipole.device
         chi = batch["chi"].to(device, non_blocking=True).float()
         mask = batch["mask"].to(device, non_blocking=True).float()
@@ -325,6 +344,24 @@ class FieldSynthesizer(torch.nn.Module):
             )
             if background_mode == "ratio":
                 ratios.append(0.03 * (3.0 / 0.03) ** float(rand()))
+            elif background_mode == "mixture":
+                mixture = float(rand())
+                fraction = float(rand())
+                if mixture < clean_probability:
+                    ratio = 0.0  # Exactly no background, with the usual noise.
+                elif mixture < clean_probability + weak_probability:
+                    ratio = 3.0 * (100.0 / 3.0) ** fraction
+                elif (
+                    mixture
+                    < clean_probability
+                    + weak_probability
+                    + strong_probability * curriculum_progress
+                ):
+                    minimum = 0.03 * (strong_min_ratio / 0.03) ** curriculum_progress
+                    ratio = minimum * (0.03 / minimum) ** fraction
+                else:
+                    ratio = 0.03 * 100.0**fraction
+                ratios.append(ratio)
             source_fields.append(exterior * (~dilated[index]) * amplitude)
             signal = chi[index]
             low = signal.masked_fill(mask[index] == 0, torch.inf).amin()
@@ -352,7 +389,8 @@ class FieldSynthesizer(torch.nn.Module):
         def inverse(x):
             return torch.fft.irfftn(x, s=self.shape, dim=SPATIAL)
 
-        local = inverse(self.dipole * torch.fft.rfftn(chi, dim=SPATIAL)) * mask
+        local_full = inverse(self.dipole * torch.fft.rfftn(chi, dim=SPATIAL))
+        local = local_full * mask
         background = (
             inverse(
                 self.dipole * torch.fft.rfftn(torch.stack(source_fields), dim=SPATIAL)
@@ -368,9 +406,10 @@ class FieldSynthesizer(torch.nn.Module):
                 .clamp_min(1e-8)
             )
 
-        if background_mode == "ratio":
+        if background_mode in ("ratio", "mixture"):
             target = torch.tensor(ratios, device=device).reshape(-1, 1, 1, 1, 1)
-            background = background * rms(local) / (rms(background) * target)
+            multiplier = torch.where(target > 0, 1 / target.clamp_min(1e-12), 0)
+            background = background * rms(local) / rms(background) * multiplier
 
         noise = torch.stack(noises) * mask
         noise = (
@@ -386,6 +425,7 @@ class FieldSynthesizer(torch.nn.Module):
             chi=chi,
             background=background,
             local=local,
+            local_full=local_full,
             noise=noise,
         )
 

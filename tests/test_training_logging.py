@@ -97,9 +97,18 @@ class TrainingAndLoggingTests(unittest.TestCase):
                 accumulation_steps=4,
                 max_train_volumes=3,
             )
+            captured = []
+            original_clip = torch.nn.utils.clip_grad_norm_
+
+            def capture_gradients(parameters, *args, **kwargs):
+                parameters = list(parameters)
+                captured.append([parameter.grad.clone() for parameter in parameters])
+                return original_clip(parameters, *args, **kwargs)
+
             with (
                 patch("dnqsm.training.reconstruction_figure", return_value=None),
                 patch.object(RunLogger, "figure"),
+                patch("torch.nn.utils.clip_grad_norm_", side_effect=capture_gradients),
             ):
                 micro = run_training(config)
                 full = run_training(
@@ -113,8 +122,13 @@ class TrainingAndLoggingTests(unittest.TestCase):
             a = torch.load(micro / "model_last.pt", weights_only=True)["model"]
             b = torch.load(full / "model_last.pt", weights_only=True)["model"]
             # InstanceNorm is per sample, so accumulation is batch-equivalent.
-            for key in a:
-                torch.testing.assert_close(a[key], b[key], rtol=5e-4, atol=3e-6)
+            for key, ga, gb in zip(a, *captured, strict=True):
+                torch.testing.assert_close(ga, gb, rtol=5e-4, atol=3e-6)
+                # Biases immediately before InstanceNorm have zero analytical
+                # gradient. Adam can amplify FP32 roundoff around its epsilon;
+                # compare their gradients, not the resulting numerical jitter.
+                if max(float(ga.abs().max()), float(gb.abs().max())) > 1e-6:
+                    torch.testing.assert_close(a[key], b[key], rtol=5e-4, atol=3e-6)
 
     def test_comet_logging_and_resume_use_saved_experiment(self):
         with tempfile.TemporaryDirectory() as temp:
