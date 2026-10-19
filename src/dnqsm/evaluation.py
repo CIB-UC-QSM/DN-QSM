@@ -402,6 +402,7 @@ def _evaluate_case(
             training_epoch=epoch,
             threshold=model.config.threshold,
             full_grid_field=model.config.full_grid_field,
+            laplacian_input=model.config.laplacian_input,
             grid_shape=list(phase.shape[-3:]),
             device=str(target),
             bf16=bool(

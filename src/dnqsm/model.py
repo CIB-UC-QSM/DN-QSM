@@ -19,6 +19,7 @@ class ModelConfig:
     checkpoint_blocks: bool = False
     residual_filter: bool = False
     full_grid_field: bool = True
+    laplacian_input: bool = True
 
     def __post_init__(self) -> None:
         if not self.features or any(v < 1 for v in self.features):
@@ -52,12 +53,17 @@ def double_conv(in_channels: int, out_channels: int) -> nn.Sequential:
 
 
 class UNet3D(nn.Module):
-    def __init__(self, features: tuple[int, ...], checkpoint_blocks: bool = False):
+    def __init__(
+        self,
+        features: tuple[int, ...],
+        checkpoint_blocks: bool = False,
+        in_channels: int = 1,
+    ):
         super().__init__()
         self.depth = len(features)
         self.checkpoint_blocks = checkpoint_blocks
         self.downs = nn.ModuleList()
-        previous = 1
+        previous = in_channels
         for width in features:
             self.downs.append(double_conv(previous, width))
             previous = width
@@ -112,7 +118,38 @@ class DNQSM(nn.Module):
     def __init__(self, config: ModelConfig | None = None):
         super().__init__()
         self.config = config or ModelConfig()
-        self.filter = UNet3D(self.config.features, self.config.checkpoint_blocks)
+        # A buffer follows the model's device and checkpoint state without
+        # becoming a trainable parameter. None preserves legacy checkpoints.
+        self.register_buffer(
+            "laplacian_kernel",
+            torch.tensor(
+                [
+                    [
+                        [1 / 13, 3 / 26, 1 / 13],
+                        [3 / 26, 3 / 13, 3 / 26],
+                        [1 / 13, 3 / 26, 1 / 13],
+                    ],
+                    [
+                        [3 / 26, 3 / 13, 3 / 26],
+                        [3 / 13, -44 / 13, 3 / 13],
+                        [3 / 26, 3 / 13, 3 / 26],
+                    ],
+                    [
+                        [1 / 13, 3 / 26, 1 / 13],
+                        [3 / 26, 3 / 13, 3 / 26],
+                        [1 / 13, 3 / 26, 1 / 13],
+                    ],
+                ],
+                dtype=torch.float32,
+            )[None, None]
+            if self.config.laplacian_input
+            else None,
+        )
+        self.filter = UNet3D(
+            self.config.features,
+            self.config.checkpoint_blocks,
+            in_channels=2 if self.config.laplacian_input else 1,
+        )
         self.null_network = UNet3D(self.config.features, self.config.checkpoint_blocks)
 
     def forward(
@@ -121,7 +158,12 @@ class DNQSM(nn.Module):
         validate_mask(mask, total_field)
         field = total_field.float() * mask
         scale = masked_rms(field, mask, self.config.scale_floor)
-        filtered = self.filter(field / scale).float() * scale
+        normalized = field / scale
+        filter_input = normalized
+        if self.laplacian_kernel is not None:
+            laplacian = F.conv3d(normalized, self.laplacian_kernel, padding=1)
+            filter_input = torch.cat((normalized, laplacian), dim=1)
+        filtered = self.filter(filter_input).float() * scale
         local = field + filtered if self.config.residual_filter else filtered
         if not self.config.full_grid_field:
             local = local * mask

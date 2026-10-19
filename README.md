@@ -31,16 +31,28 @@ Volumes use `[N,1,D,H,W]`. Inputs, local fields, and susceptibility use physical
 ppm units and the reference's unshifted continuous dipole kernel convention.
 The initial small baseline uses widths `[16,32,64]` and a 128-channel bottleneck.
 The current twice-baseline profile uses `[23,47,90]` and a 180-channel bottleneck:
-**6,421,406 parameters**, versus 3,212,514 in the baseline (1.999×).
+**6,422,027 parameters**, versus 3,212,946 in the baseline (1.999×), both with
+the Laplacian input channel enabled.
 The large overfit profile below uses five wider levels. All use InstanceNorm/CELU
 double-convolution blocks and trilinear upsampling. Inputs are normalized by
 masked RMS, and outputs are rescaled to ppm.
 
-1. A U-Net maps the masked total field to a **full-grid** clean local field
-   `local`, including its exterior extension. Residual filtering computes
-   `local = field + scale * UNet(field/scale)`; `--no-residual-filter` selects
+1. The phase-filtering U-Net receives two channels: the masked total field and
+   its convolution with the fixed 3×3×3 Laplacian kernel. The kernel has center
+   coefficient `-44/13`, six face neighbors `3/13`, twelve edge neighbors `3/26`,
+   and eight corner neighbors `1/13`. It is a non-trainable checkpoint buffer;
+   convolution uses stride 1 and zero padding 1 to preserve the volume shape.
+   Both channels share the input's masked RMS scale: for `u = field/scale`,
+   `filter_input = cat([u, Laplacian(u)], dim=1)`. The U-Net produces a
+   **full-grid** clean local field `local`, including its exterior extension.
+   Residual filtering computes
+   `local = field + scale * UNet(filter_input)`; `--no-residual-filter` selects
    direct output. `--no-full-grid-field --lambda-extension 0` provides a masked
-   field ablation. Historical checkpoints retain their masked-field behavior.
+   field ablation. `--no-laplacian-input` selects the previous one-channel
+   architecture. Historical checkpoints retain their original input channels
+   and field behavior when evaluated or exactly resumed. Training the updated
+   architecture requires a fresh run; old one-channel weights are not silently
+   converted.
 2. TKD computes `chi0 = F^-1(B_tau * F(local))`, where `B_tau=1/D` for
    `abs(D)>tau` and zero otherwise. The default threshold is `tau=0.1`.
 3. A second U-Net predicts a susceptibility residual from `chi0`. The output is
@@ -222,8 +234,10 @@ Exact resume preserves interpolation, loss floors/weights and warmup, curriculum
 full-grid field behavior, and validation definition. Checkpoints record loss
 version **3**. Earlier objectives cannot silently resume with the normalized
 objective and exterior supervision. For inference, historical checkpoints
-continue using their original masked-field behavior. To reuse their weights,
-start a separate experiment with `--init-checkpoint <old-run>/model_last.pt`;
+continue using their original masked-field behavior. To reuse weights with
+matching input channels, start a separate experiment with
+`--init-checkpoint <old-run>/model_last.pt` (add `--no-laplacian-input` for
+historical one-channel checkpoints);
 this resets the optimizer, scheduler, and training cursor and preserves the old
 run's history. Do not initialize a full run from COSMOS-overfitted weights.
 

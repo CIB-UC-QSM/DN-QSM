@@ -45,6 +45,7 @@ class OverfitConfig:
     checkpoint_blocks: bool = True
     residual_filter: bool = True
     full_grid_field: bool = True
+    laplacian_input: bool = True
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -104,6 +105,7 @@ class OverfitConfig:
             checkpoint_blocks=self.checkpoint_blocks,
             residual_filter=self.residual_filter,
             full_grid_field=self.full_grid_field,
+            laplacian_input=self.laplacian_input,
         )
         LossWeights(
             self.lambda_forward,
@@ -167,8 +169,12 @@ def _run_overfit(
         if (
             tuple(resumed["model_config"]["features"]) != tuple(config.features)
             or resumed["model_config"]["threshold"] != config.threshold
+            or resumed["model_config"].get("laplacian_input", False)
+            != config.laplacian_input
         ):
-            raise ValueError("Resume must preserve model capacity and TKD threshold")
+            raise ValueError(
+                "Resume must preserve model capacity, phase-filter input channels, and TKD threshold"
+            )
         if (
             Path(resumed["config"]["cosmos_simulation"]).resolve()
             != Path(config.cosmos_simulation).resolve()
@@ -242,6 +248,7 @@ def _run_overfit(
             checkpoint_blocks=config.checkpoint_blocks,
             residual_filter=config.residual_filter,
             full_grid_field=config.full_grid_field,
+            laplacian_input=config.laplacian_input,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -584,6 +591,7 @@ def main(argv: list[str] | None = None) -> None:
             overrides["resume"], weights_only=True, map_location="cpu", mmap=True
         )
         values.update(checkpoint["config"])
+        values["laplacian_input"] = checkpoint["config"].get("laplacian_input", False)
         del checkpoint
     values.update(overrides)
     values["features"] = tuple(values["features"])

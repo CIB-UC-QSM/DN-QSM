@@ -122,7 +122,11 @@ class TrainingAndLoggingTests(unittest.TestCase):
             a = torch.load(micro / "model_last.pt", weights_only=True)["model"]
             b = torch.load(full / "model_last.pt", weights_only=True)["model"]
             # InstanceNorm is per sample, so accumulation is batch-equivalent.
-            for key, ga, gb in zip(a, *captured, strict=True):
+            # Fixed buffers have checkpoint state but no optimizer gradients.
+            parameter_names = dict(
+                load_trained_model(micro / "model_last.pt").named_parameters()
+            )
+            for key, ga, gb in zip(parameter_names, *captured, strict=True):
                 torch.testing.assert_close(ga, gb, rtol=5e-4, atol=3e-6)
                 # Biases immediately before InstanceNorm have zero analytical
                 # gradient. Adam can amplify FP32 roundoff around its epsilon;

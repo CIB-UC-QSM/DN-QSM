@@ -84,6 +84,7 @@ class TrainConfig:
     checkpoint_blocks: bool = True
     residual_filter: bool = False
     full_grid_field: bool = True
+    laplacian_input: bool = True
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
@@ -173,6 +174,7 @@ class TrainConfig:
             self.checkpoint_blocks,
             self.residual_filter,
             self.full_grid_field,
+            self.laplacian_input,
         )
         LossWeights(
             self.lambda_forward,
@@ -212,6 +214,7 @@ def model_config(config: TrainConfig) -> ModelConfig:
         config.checkpoint_blocks,
         config.residual_filter,
         config.full_grid_field,
+        config.laplacian_input,
     )
 
 
@@ -558,6 +561,7 @@ def run_training(config: TrainConfig) -> Path:
         previous = json.loads(json.dumps(resume["config"]))
         previous.setdefault("residual_filter", False)
         previous.setdefault("crop_resize", False)
+        previous.setdefault("laplacian_input", False)
         for key in ("crop_probability", "external_eval_every", "cuda_allocator_config"):
             previous.setdefault(key, getattr(TrainConfig(), key))
         changed = [
@@ -590,6 +594,11 @@ def run_training(config: TrainConfig) -> Path:
     model = DNQSM(model_config(config)).to(device)
     if config.init_checkpoint:
         initialized = load_trained_model(config.init_checkpoint, "cpu")
+        if initialized.config.laplacian_input != config.laplacian_input:
+            raise ValueError(
+                "Initialization checkpoint has different phase-filter input channels. "
+                "Start a fresh run for the updated architecture, or match --laplacian-input/--no-laplacian-input."
+            )
         model.load_state_dict(initialized.state_dict())
         del initialized
     optimizer = torch.optim.AdamW(
@@ -702,6 +711,7 @@ def run_training(config: TrainConfig) -> Path:
             validation_profile="matched",
             normalize_loss=config.normalize_loss,
             full_grid_field=config.full_grid_field,
+            laplacian_input=config.laplacian_input,
         )
         while epoch < config.epochs:
             if config.max_steps and step >= config.max_steps:
@@ -1038,6 +1048,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         values.update(saved["config"])
         # Exact resume preserves the native-crop behavior of older checkpoints.
         values["crop_resize"] = saved["config"].get("crop_resize", False)
+        values["laplacian_input"] = saved["config"].get("laplacian_input", False)
         values["init_checkpoint"] = None
     values.update(overrides)
     values["features"] = tuple(values["features"])

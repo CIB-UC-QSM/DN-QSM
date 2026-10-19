@@ -269,8 +269,8 @@ class CropTrainingTests(unittest.TestCase):
     def test_capacity_and_native_frequency_coordinates(self):
         with torch.device("meta"):
             model = DNQSM(ModelConfig((23, 47, 90)))
-        self.assertEqual(sum(p.numel() for p in model.parameters()), 6421406)
-        self.assertLess(abs(6421406 / (2 * 3212514) - 1), 0.001)
+        self.assertEqual(sum(p.numel() for p in model.parameters()), 6422027)
+        self.assertLess(abs(6422027 / (2 * 3212946) - 1), 0.001)
         shape, spacing = (7, 9, 11), (1, 2, 3)
         kernel = continuous_dipole_kernel(shape, spacing)
         frequencies = [
