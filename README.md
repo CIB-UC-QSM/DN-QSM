@@ -125,6 +125,18 @@ result = model(total_field, mask, dipole)
 
 ## Data and training
 
+The matched joint/frozen-phase study is available through
+`python -m dnqsm.staged_experiment --study <study-directory>`. It consumes a saved
+phase-pretraining boundary and persisted subject split, initializes Deep Null
+once per paired seed, and trains joint and frozen-phase branches on identical
+draws. The frozen branch excludes the phase model from autograd and AdamW;
+both branches use per-network clipping and matched update-based schedules.
+The runner saves resumable checkpoints, per-view and subject metrics, a paired
+bootstrap comparison, external results, and learning curves. It rejects a
+concurrent runner for the same study. See the
+[study design](docs/plans/joint_vs_frozen_phase_experiment.md) for its budgets,
+initialization choices, and limitations.
+
 By default, training reads `../wh_net/data/training/joint/` without modifying its
 source files. Override `--data-dir`, or set `DNQSM_REFERENCE_ROOT` before launching
 to change the reference root. Other datasets contain `image_XXXX.pt` and
