@@ -194,6 +194,24 @@ and `validation_stress` remain unchanged. Training logs and resumed checkpoints
 record realized profile and fallback counts; sample metadata records proposed
 mixture parameters, remapping bounds, target RMS, and achieved RMS.
 
+Run a paired data-only comparison before training:
+
+```bash
+.venv/bin/python scripts/analyze_domain_histograms.py --chi-policy-audit \
+  --epochs 53 54 55 --max-per-epoch 192 --workers 4 \
+  --output artifacts/diagnostics/chi_augmentation_audit
+```
+
+Omit `--max-per-epoch` to audit complete epochs. Use
+`--policy-config A3=configs/chi_augmentation_A3.json` to audit custom ranges.
+Outputs include shared-bin physical and normalized histograms, per-profile and
+cohort summaries, per-image distances, spatial gradients, radial spectra, tail
+energy, and paired susceptibility/field examples. Sim2's clean local field is a
+forward-model proxy. These audits measure coverage; reconstruction improvements
+require held-out training comparisons. See the
+[implementation plan](docs/plans/chi_distribution_augmentation.md) for the
+experimental controls and interpretation of development-informed benchmarks.
+
 `--crop-probability 0.2` additionally selects 20% of training samples in
 expectation for a tight foreground-mask bounding-box crop. Selection is
 deterministic per sampled view and epoch. Cropping follows the existing flips
@@ -378,7 +396,9 @@ three fixed views each; they do not establish converged or clinical performance.
 The external COSMOS advantage did not repeat across seeds. Use
 `--conditional-laplacian-threshold 0` for a comparison with total-RMS scaling;
 this is also required when selecting a historical version-1 architecture.
-InstanceNorm and the existing physics loss remain the defaults.
+InstanceNorm and the existing physics loss remain the defaults. The experiment
+runner is `scripts/normalization_ablation.py`; complete local evidence is in
+`artifacts/diagnostics/normalization_ablation_20261019/`.
 
 ```sh
 uv run python -m dnqsm.batch_size --config configs/corrective_200epochs.json \
