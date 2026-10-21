@@ -26,6 +26,7 @@ class TrainingAndLoggingTests(unittest.TestCase):
     def config(self, root: Path, data: Path, name: str) -> TrainConfig:
         return TrainConfig(
             filter_pretrain_epochs=0,
+            training_schedule="joint",
             data_dir=str(data),
             cache_dir=str(root / "cache"),
             run_dir=str(root / name),
@@ -86,7 +87,7 @@ class TrainingAndLoggingTests(unittest.TestCase):
             ]
             self.assertEqual(len([r for r in events if r["event"] == "validation"]), 2)
             with self.assertRaisesRegex(ValueError, "Resume configuration changed"):
-                run_training(replace(resumed, threshold=0.2))
+                run_training(replace(resumed, threshold=0.3))
 
     def test_partial_accumulation_group_equals_full_batch(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):

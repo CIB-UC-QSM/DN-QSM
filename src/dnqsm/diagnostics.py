@@ -19,11 +19,15 @@ def loss_gradient_metrics(model, terms, weights):
     vectors = {}
     metrics = {}
     for name, term in terms.items():
-        gradients = torch.autograd.grad(
-            term,
-            [parameter for _, parameter in named],
-            retain_graph=True,
-            allow_unused=True,
+        gradients = (
+            torch.autograd.grad(
+                term,
+                [parameter for _, parameter in named],
+                retain_graph=True,
+                allow_unused=True,
+            )
+            if term.requires_grad
+            else (None,) * len(named)
         )
         vectors[name] = {}
         for branch, positions in indices.items():

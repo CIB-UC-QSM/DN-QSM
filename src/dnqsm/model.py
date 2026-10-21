@@ -14,15 +14,31 @@ from .physics import apply_multiplier, cutoff_kernels, masked_rms, validate_mask
 @dataclass(frozen=True)
 class ModelConfig:
     features: tuple[int, ...] = (16, 32, 64)
-    threshold: float = 0.1
+    threshold: float = 0.2
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = False
     residual_filter: bool = False
     full_grid_field: bool = False
     laplacian_input: bool = True
     filter_input_version: int = 2
+    laplacian_fp32: bool = True
+    conditional_laplacian_threshold: float = 32.0
+    filter_output_skip: bool = True
 
     def __post_init__(self) -> None:
+        if (
+            not math.isfinite(self.conditional_laplacian_threshold)
+            or self.conditional_laplacian_threshold < 0
+        ):
+            raise ValueError(
+                "Conditional Laplacian threshold must be finite and nonnegative"
+            )
+        if self.conditional_laplacian_threshold and (
+            not self.laplacian_fp32 or self.filter_input_version != 2
+        ):
+            raise ValueError(
+                "Conditional Laplacian scaling requires FP32 version-2 filtering"
+            )
         if self.filter_input_version not in (1, 2):
             raise ValueError("Unsupported filter input version")
         if self.filter_input_version == 2 and (
@@ -69,10 +85,12 @@ class UNet3D(nn.Module):
         features: tuple[int, ...],
         checkpoint_blocks: bool = False,
         in_channels: int = 1,
+        output_skip_channels: int = 0,
     ):
         super().__init__()
         self.depth = len(features)
         self.checkpoint_blocks = checkpoint_blocks
+        self.output_skip_channels = output_skip_channels
         self.downs = nn.ModuleList()
         previous = in_channels
         for width in features:
@@ -86,16 +104,27 @@ class UNet3D(nn.Module):
             self.up_convs.append(nn.Conv3d(previous, width, 3, padding=1))
             self.up_blocks.append(double_conv(width * 2, width))
             previous = width
-        self.final = nn.Conv3d(features[0], 1, 1)
+        self.final = nn.Conv3d(features[0] + output_skip_channels, 1, 1)
         nn.init.normal_(self.final.weight, std=0.01)
         nn.init.zeros_(self.final.bias)
+        if output_skip_channels:
+            with torch.no_grad():
+                self.final.weight[:, features[0] :].zero_()
 
     def _block(self, block: nn.Module, x: Tensor) -> Tensor:
         if self.checkpoint_blocks and self.training and torch.is_grad_enabled():
             return checkpoint(block, x, use_reentrant=False)
         return block(x)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, output_skip: Tensor | None = None) -> Tensor:
+        if self.output_skip_channels:
+            expected = (x.shape[0], self.output_skip_channels, *x.shape[-3:])
+            if output_skip is None or tuple(output_skip.shape) != expected:
+                raise ValueError(
+                    "Output skip must match the input batch and spatial shape"
+                )
+        elif output_skip is not None:
+            raise ValueError("This U-Net has no output skip channels")
         # InstanceNorm needs >1 voxel at the bottleneck. Padding is internal to
         # the CNN; FFT grids and the externally visible geometry never change.
         minimum = 2 ** (self.depth + 1)
@@ -105,6 +134,8 @@ class UNet3D(nn.Module):
         shape = x.shape[-3:]
         if any(padding):
             x = F.pad(x, padding)
+            if output_skip is not None:
+                output_skip = F.pad(output_skip, padding)
         skips = []
         for block in self.downs:
             x = self._block(block, x)
@@ -122,6 +153,8 @@ class UNet3D(nn.Module):
                 )
             )
             x = self._block(block, torch.cat((skip, x), dim=1))
+        if output_skip is not None:
+            x = torch.cat((x, output_skip.to(dtype=x.dtype)), dim=1)
         return self.final(x)[..., : shape[0], : shape[1], : shape[2]]
 
 
@@ -162,8 +195,35 @@ class DNQSM(nn.Module):
             in_channels=2
             if self.config.filter_input_version == 1 and self.config.laplacian_input
             else 1,
+            output_skip_channels=int(self.config.filter_output_skip),
         )
         self.null_network = UNet3D(self.config.features, self.config.checkpoint_blocks)
+
+    def initialize_from(self, source: "DNQSM") -> None:
+        """Warm-start weights, zero-extending an older filter's output head."""
+        if any(
+            getattr(source.config, name) != getattr(self.config, name)
+            for name in (
+                "filter_input_version",
+                "laplacian_input",
+                "residual_filter",
+                "full_grid_field",
+            )
+        ):
+            raise ValueError(
+                "Initialization checkpoint has a different filtering architecture"
+            )
+        state = source.state_dict()
+        if self.config.filter_output_skip and not source.config.filter_output_skip:
+            weight = state["filter.final.weight"]
+            state["filter.final.weight"] = torch.cat(
+                (weight, torch.zeros_like(weight[:, :1])), dim=1
+            )
+        elif source.config.filter_output_skip and not self.config.filter_output_skip:
+            raise ValueError(
+                "Initialization cannot discard a trained filter output skip"
+            )
+        self.load_state_dict(state)
 
     def predict_local_field(self, total_field: Tensor, mask: Tensor) -> Tensor:
         """Predict the clean field, masking both sides of the learned filter."""
@@ -173,13 +233,43 @@ class DNQSM(nn.Module):
         normalized = field / scale
         filter_input = normalized
         if self.laplacian_kernel is not None:
-            laplacian = F.conv3d(normalized, self.laplacian_kernel, padding=1)
+            if self.config.laplacian_fp32:
+                # Autocast rounds the fractional stencil to a nonzero sum in
+                # BF16, leaking constant backgrounds into this derivative.
+                with torch.autocast(total_field.device.type, enabled=False):
+                    laplacian = F.conv3d(
+                        normalized.float(), self.laplacian_kernel.float(), padding=1
+                    )
+            else:
+                # Preserve the exact preprocessing of historical checkpoints.
+                laplacian = F.conv3d(normalized, self.laplacian_kernel, padding=1)
             filter_input = (
                 torch.cat((normalized, laplacian), dim=1)
                 if self.config.filter_input_version == 1
                 else laplacian
             )
-        filtered = self.filter(filter_input).float() * scale
+            if self.config.conditional_laplacian_threshold:
+                with torch.autocast(total_field.device.type, enabled=False):
+                    valid = (
+                        F.avg_pool3d(mask.float(), 3, stride=1, padding=1) > 1 - 1e-6
+                    ).float()
+                    interior_scale = masked_rms(
+                        laplacian.float() * scale, valid, self.config.scale_floor
+                    )
+                    selected = (
+                        scale / interior_scale
+                        >= self.config.conditional_laplacian_threshold
+                    ) & (valid.sum(dim=(-3, -2, -1), keepdim=True) > 0)
+                    interior_input = valid * laplacian.float() * scale / interior_scale
+                    filter_input = torch.where(
+                        selected, interior_input, laplacian.float()
+                    )
+                    scale = torch.where(selected, interior_scale, scale)
+        filtered = (
+            self.filter(filter_input, field / scale)
+            if self.config.filter_output_skip
+            else self.filter(filter_input)
+        ).float() * scale
         local = field + filtered if self.config.residual_filter else filtered
         if not self.config.full_grid_field:
             local = local * mask

@@ -186,7 +186,12 @@ class CropTrainingTests(unittest.TestCase):
             samples = [full[0], full[1], cropped[0]]
             torch.manual_seed(17)
             grouped = DNQSM(
-                ModelConfig((2, 4), residual_filter=True, filter_input_version=1)
+                ModelConfig(
+                    (2, 4),
+                    residual_filter=True,
+                    filter_input_version=1,
+                    conditional_laplacian_threshold=0,
+                )
             )
             reference = copy.deepcopy(grouped)
             config = TrainConfig(device="cpu", bf16=False)
@@ -272,8 +277,8 @@ class CropTrainingTests(unittest.TestCase):
     def test_capacity_and_native_frequency_coordinates(self):
         with torch.device("meta"):
             model = DNQSM(ModelConfig((23, 47, 90)))
-        self.assertEqual(sum(p.numel() for p in model.parameters()), 6421406)
-        self.assertLess(abs(6421406 / (2 * 3212514) - 1), 0.001)
+        self.assertEqual(sum(p.numel() for p in model.parameters()), 6421407)
+        self.assertLess(abs(6421407 / (2 * 3212515) - 1), 0.001)
         shape, spacing = (7, 9, 11), (1, 2, 3)
         kernel = continuous_dipole_kernel(shape, spacing)
         frequencies = [

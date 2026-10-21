@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler, default_collate
 
+from .chi_augmentation import PROFILES, ChiAugmentationConfig, augment_chi
 from .physics import SPATIAL, continuous_dipole_kernel
 
 TRAINING_CONDITIONS = {
@@ -95,6 +96,8 @@ class TrainingVolumes(Dataset):
         chi_scale_mode="legacy",
         crop_probability=0.0,
         crop_resize=True,
+        chi_augmentation=None,
+        shape_stress=False,
     ):
         self.records = records
         self.cache_dir = Path(cache_dir)
@@ -107,6 +110,19 @@ class TrainingVolumes(Dataset):
         if chi_scale_mode not in ("legacy", "rms_mixture"):
             raise ValueError(f"Unknown chi scale mode: {chi_scale_mode}")
         self.chi_scale_mode = chi_scale_mode
+        policy = ChiAugmentationConfig.from_dict(chi_augmentation)
+        if shape_stress and (not validation or views != 3 or not policy.enabled):
+            raise ValueError(
+                "Shape stress requires three fixed validation views and final-grid RMS"
+            )
+        # Ordinary validation must remain identical even if a caller passes
+        # the training policy. Shape stress is a separate, explicit suite.
+        self.chi_augmentation = (
+            policy if not validation or shape_stress else ChiAugmentationConfig()
+        )
+        self.shape_stress = shape_stress
+        if self.chi_augmentation.enabled and chi_scale_mode != "rms_mixture":
+            raise ValueError("Chi augmentation requires rms_mixture scaling")
         import multiprocessing
 
         self.epoch = multiprocessing.Value("q", 0)
@@ -179,14 +195,17 @@ class TrainingVolumes(Dataset):
             if flips:
                 volume = volume.flip(flips)
             result[key] = volume.contiguous()
+        target_rms = -1.0
         if self.chi_scale_mode == "legacy":
             scale = float(torch.empty(()).uniform_(0.5, 3, generator=generator))
         else:
             chi_rms = (
                 (result["chi"].square() * result["mask"]).sum() / result["mask"].sum()
             ).sqrt()
-            scale = sample_target_chi_rms(generator) / max(float(chi_rms), 1e-8)
-        result["chi"] = result["chi"] * scale
+            target_rms = sample_target_chi_rms(generator)
+            scale = target_rms / max(float(chi_rms), 1e-8)
+        if not self.chi_augmentation.final_grid_rms:
+            result["chi"] = result["chi"] * scale
         original_shape = tuple(result["chi"].shape[-3:])
         crop_start = (0, 0, 0)
         crop_selected = bool(
@@ -231,6 +250,39 @@ class TrainingVolumes(Dataset):
             result["chi"] *= result["mask"]
             # Keep the exterior-source exclusion at seven output-grid voxels.
             result["dilated"] = separable_dilation(result["mask"])
+        result["chi"], chi_metadata = augment_chi(
+            result["chi"],
+            result["mask"],
+            self.chi_augmentation,
+            sample_seed,
+            record["subject"],
+            forced_profile=PROFILES[index % self.views] if self.shape_stress else None,
+        )
+        before_rms = (
+            (result["chi"].square() * result["mask"]).sum() / result["mask"].sum()
+        ).sqrt()
+        if self.chi_augmentation.final_grid_rms:
+            result["chi"] = (
+                result["chi"]
+                * (target_rms / max(float(before_rms), 1e-8))
+                * result["mask"]
+            )
+        final_rms = (
+            (
+                (result["chi"].square() * result["mask"]).sum() / result["mask"].sum()
+            ).sqrt()
+            if self.chi_augmentation.final_grid_rms
+            else before_rms
+        )
+        result.update(
+            chi_profile=chi_metadata["profile"],
+            chi_requested_profile=chi_metadata["requested_profile"],
+            chi_fallback=chi_metadata["fallback"],
+            chi_parameters=json.dumps(chi_metadata["parameters"], sort_keys=True),
+            chi_rms_target=target_rms,
+            chi_rms_final=float(final_rms),
+            chi_rms_before_final_scale=float(before_rms),
+        )
         result.update(
             original_shape=torch.tensor(original_shape),
             crop_start=torch.tensor(crop_start),

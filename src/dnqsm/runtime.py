@@ -53,10 +53,14 @@ def load_trained_model(
     if saved.get("version") != CHECKPOINT_VERSION:
         raise ValueError("Unsupported DN-QSM checkpoint version")
     config = dict(saved["model_config"])
+    config.setdefault("threshold", 0.1)
     # Historical checkpoints were trained with a zeroed exterior field.
     config.setdefault("full_grid_field", False)
     config.setdefault("laplacian_input", False)
     config.setdefault("filter_input_version", 1)
+    config.setdefault("laplacian_fp32", False)
+    config.setdefault("conditional_laplacian_threshold", 0.0)
+    config.setdefault("filter_output_skip", False)
     config["features"] = tuple(config["features"])
     model = DNQSM(ModelConfig(**config)).to(device)
     model.load_state_dict(saved["model"])

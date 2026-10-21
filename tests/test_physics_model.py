@@ -62,7 +62,12 @@ class PhysicsAndModelTests(unittest.TestCase):
         mask[..., :2, :, :] = 0
         for residual in (False, True):
             model = DNQSM(
-                ModelConfig((2, 4), residual_filter=residual, filter_input_version=1)
+                ModelConfig(
+                    (2, 4),
+                    residual_filter=residual,
+                    filter_input_version=1,
+                    conditional_laplacian_threshold=0,
+                )
             )
             with torch.no_grad():
                 model.filter.final.weight.zero_()
@@ -86,7 +91,7 @@ class PhysicsAndModelTests(unittest.TestCase):
     def test_projection_idempotence_and_retained_frequency_preservation(self):
         shape = (13, 15, 17)
         dipole = dipole_tensor(shape)
-        _, projection = cutoff_kernels(dipole, 0.1)
+        _, projection = cutoff_kernels(dipole, ModelConfig().threshold)
         volume = torch.randn(1, 1, *shape)
         projected = apply_multiplier(volume, projection)
         torch.testing.assert_close(

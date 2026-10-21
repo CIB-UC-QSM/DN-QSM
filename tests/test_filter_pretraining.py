@@ -11,7 +11,9 @@ import torch
 
 from dnqsm.losses import LossWeights, per_sample_loss_terms, reconstruction_loss
 from dnqsm.model import DNQSM, ModelConfig
+from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import dipole_tensor
+from dnqsm.runtime import load_trained_model
 from dnqsm.training import (
     TrainConfig,
     parse_args,
@@ -35,6 +37,7 @@ class FilterPretrainingTests(unittest.TestCase):
             threads=2,
             epochs=2,
             filter_pretrain_epochs=2,
+            training_schedule="joint",
             max_train_volumes=2,
             batch_size=1,
             accumulation_steps=1,
@@ -61,106 +64,151 @@ class FilterPretrainingTests(unittest.TestCase):
         else:
             self.assertEqual(actual, expected)
 
-    def test_default_ten_epochs_train_filter_only_then_both_networks(self):
+    def test_default_ten_epochs_then_alternate_without_updating_frozen_weights(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
             root = Path(temp)
-            data = make_dataset(root)
             config = replace(
-                self.config(root, data, "run"),
-                epochs=1,
+                self.config(root, make_dataset(root), "run"),
+                training_schedule="alternating",
+                epochs=2,
                 filter_pretrain_epochs=10,
-                max_train_volumes=1,
-                external_eval_every=1,
+                max_train_volumes=3,
+                weight_decay=0.1,
             )
-            torch.manual_seed(config.seed)
-            initial = DNQSM(ModelConfig(features=config.features)).state_dict()
-            parameter_names = list(
-                dict(DNQSM(ModelConfig(config.features)).named_parameters())
-            )
-            snapshots, forwards = [], []
             adam_step = torch.optim.AdamW.step
             model_forward = DNQSM.forward
+            snapshots = []
+            split = len(list(DNQSM(ModelConfig(config.features)).filter.parameters()))
 
             def step(optimizer, *args, **kwargs):
-                # All parameters stay in the optimizer so filter moments survive.
                 parameters = optimizer.param_groups[0]["params"]
-                snapshots.append([p.grad is not None for p in parameters])
-                if len(snapshots) <= 10:
-                    for name, parameter in zip(
-                        parameter_names, parameters, strict=True
-                    ):
-                        if name.startswith("null_network."):
-                            torch.testing.assert_close(
-                                parameter, initial[name], rtol=0, atol=0
-                            )
-                return adam_step(optimizer, *args, **kwargs)
+                phase_active = len(snapshots) < 30 or (len(snapshots) - 30) % 2 == 0
+                # Both weights and existing Adam moments must remain bitwise fixed.
+                frozen = parameters[split:] if phase_active else parameters[:split]
+                before = [p.detach().clone() for p in frozen]
+                states = [
+                    {
+                        k: v.clone() if isinstance(v, torch.Tensor) else v
+                        for k, v in optimizer.state.get(p, {}).items()
+                    }
+                    for p in frozen
+                ]
+                for i, p in enumerate(parameters):
+                    active = i < split if phase_active else i >= split
+                    self.assertEqual(p.requires_grad, active)
+                    self.assertEqual(p.grad is not None, active)
+                result = adam_step(optimizer, *args, **kwargs)
+                for p, value, state in zip(frozen, before, states, strict=True):
+                    torch.testing.assert_close(p, value, rtol=0, atol=0)
+                    self.assert_same(optimizer.state.get(p, {}), state)
+                snapshots.append(phase_active)
+                return result
 
             def forward(model, *args, **kwargs):
-                self.assertTrue(
-                    all(p.requires_grad for p in model.null_network.parameters())
-                )
-                forwards.append(model.training)
-                return model_forward(model, *args, **kwargs)
+                if model.training:
+                    self.assertFalse(model.filter.training)
+                    self.assertTrue(model.null_network.training)
+                output = model_forward(model, *args, **kwargs)
+                if model.training:
+                    self.assertFalse(output.local_field.requires_grad)
+                    self.assertFalse(output.tkd.requires_grad)
+                    self.assertTrue(output.chi.requires_grad)
+                return output
 
             with (
                 patch("dnqsm.training.filtering_figure", return_value=None),
                 patch("dnqsm.training.reconstruction_figure", return_value=None),
                 patch.object(torch.optim.AdamW, "step", step),
                 patch.object(DNQSM, "forward", forward),
-                patch(
-                    "dnqsm.training.evaluation.load_cases", return_value=[]
-                ) as load_cases,
-                patch("dnqsm.training.evaluation.evaluate_training_epoch") as external,
             ):
                 directory = run_training(config)
             saved = torch.load(directory / "training_last.pt", weights_only=True)
-            load_cases.assert_called_once()
-            external.assert_called_once()
-            self.assertEqual(external.call_args.args[6], 11)
-            self.assertEqual((saved["epoch"], saved["step"]), (11, 11))
-            # Only joint training and its two validation suites use full forward.
-            self.assertEqual(sum(forwards), 1)
-            subjects = {
-                r["subject"]
-                for r in json.loads((directory / "split.json").read_text())[
-                    "validation"
-                ]
-            }
-            self.assertEqual(len(forwards), 1 + 2 * len(subjects))
-            split = len(list(DNQSM(ModelConfig(config.features)).filter.parameters()))
-            for grads in snapshots[:10]:
-                self.assertTrue(all(grads[:split]))
-                self.assertFalse(any(grads[split:]))
-            self.assertTrue(all(snapshots[10]))
-            states = list(saved["optimizer"]["state"].values())
-            self.assertTrue(all(int(s["step"]) == 11 for s in states[:split]))
-            self.assertTrue(all(int(s["step"]) == 1 for s in states[split:]))
-            for branch in ("filter.", "null_network."):
-                self.assertTrue(
-                    any(
-                        not torch.equal(value, initial[name])
-                        for name, value in saved["model"].items()
-                        if name.startswith(branch)
-                    )
-                )
+            self.assertEqual((saved["epoch"], saved["step"]), (12, 36))
+            self.assertEqual(snapshots, [True] * 30 + [True, False] * 3)
             rows = [
                 json.loads(line)
                 for line in (directory / "metrics.jsonl").read_text().splitlines()
             ]
+            training = [row for row in rows if row["event"] == "train"]
+            self.assertEqual(
+                [r["training_branch"] for r in training],
+                ["phase"] * 30 + ["phase", "chi"] * 3,
+            )
+            for row in training:
+                if row["training_branch"] == "phase":
+                    self.assertNotIn("chi", row)
+                    self.assertEqual(row["active_physics_weight"], 0)
+                    self.assertAlmostEqual(
+                        row["loss"], config.lambda_local * row["local"], places=6
+                    )
+                else:
+                    self.assertAlmostEqual(
+                        row["loss"],
+                        config.lambda_chi * row["chi"]
+                        + config.lambda_physics * row["physics"],
+                        places=6,
+                    )
+                    self.assertEqual(row["grad_filter_local"], 0)
+                    self.assertGreater(row["grad_null_network_chi"], 0)
             validation = [row for row in rows if row["event"] == "validation"]
             self.assertEqual(
                 [r["phase"] for r in validation],
-                ["filter_pretrain"] * 10 + ["end_to_end"],
+                ["filter_pretrain"] * 10 + ["alternating"] * 2,
             )
-            for row in validation[:10]:
-                self.assertIn("local_nrmse", row)
-                self.assertNotIn("chi_nrmse", row)
-                self.assertAlmostEqual(
-                    row["loss"], config.lambda_local * row["local"], places=6
-                )
-            self.assertTrue(all("extension" not in row for row in validation))
+            self.assertTrue(all("chi_nrmse" not in row for row in validation[:10]))
+            self.assertTrue(all("chi_nrmse" in row for row in validation[10:]))
+            split = len(list(DNQSM(ModelConfig(config.features)).filter.parameters()))
+            states = list(saved["optimizer"]["state"].values())
+            self.assertTrue(all(int(s["step"]) == 33 for s in states[:split]))
+            self.assertTrue(all(int(s["step"]) == 3 for s in states[split:]))
             best = torch.load(directory / "model_best.pt", weights_only=True)
-            self.assertEqual((best["phase"], best["epoch"]), ("end_to_end", 11))
+            self.assertEqual(best["phase"], "alternating")
+
+    def test_alternating_resume_preserves_batch_parity_across_odd_epochs(self):
+        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
+            root = Path(temp)
+            config = replace(
+                self.config(root, make_dataset(root), "whole"),
+                training_schedule="alternating",
+                filter_pretrain_epochs=1,
+                max_train_volumes=3,
+                crop_probability=0.5,
+                crop_resize=False,
+                checkpoint_blocks=True,
+            )
+            with (
+                patch("dnqsm.training.filtering_figure", return_value=None),
+                patch("dnqsm.training.reconstruction_figure", return_value=None),
+            ):
+                whole = run_training(config)
+                expected = torch.load(whole / "training_last.pt", weights_only=True)
+                for limit in (1, 3, 4, 5, 6, 7):
+                    partial = run_training(
+                        replace(
+                            config, run_dir=str(root / f"part{limit}"), max_steps=limit
+                        )
+                    )
+                    path = partial / "training_last.pt"
+                    run_training(
+                        parse_args(["--resume", str(path), "--max-steps", "0"])
+                    )
+                    actual = torch.load(path, weights_only=True)
+                    for key in (
+                        "model",
+                        "optimizer",
+                        "scheduler",
+                        "rng",
+                        "step",
+                        "epoch",
+                    ):
+                        self.assert_same(actual[key], expected[key])
+                with self.assertRaisesRegex(ValueError, "Resume configuration changed"):
+                    run_training(
+                        replace(
+                            parse_args(["--resume", str(path)]),
+                            training_schedule="joint",
+                        )
+                    )
 
     def test_resume_inside_pretraining_at_transition_and_inside_joint_is_exact(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
@@ -252,13 +300,27 @@ class FilterPretrainingTests(unittest.TestCase):
         )
         self.assertEqual(phased_learning_rate_multiplier(config, 20, 2), 0.25)
         self.assertEqual(
-            phase_metadata(config, 10), dict(phase="end_to_end", phase_epoch=1)
+            phase_metadata(config, 10), dict(phase="alternating", phase_epoch=1)
         )
         disabled = parse_args(["--filter-pretrain-epochs", "0"])
-        self.assertEqual(phase_metadata(disabled, 0)["phase"], "end_to_end")
+        self.assertEqual(phase_metadata(disabled, 0)["phase"], "alternating")
         for value in (-1, 0.5, float("inf")):
             with self.assertRaisesRegex(ValueError, "pretraining epochs"):
                 replace(config, filter_pretrain_epochs=value).validate()
+
+    def test_default_schedule_threshold_and_accumulation_validation(self):
+        default = parse_args([])
+        self.assertEqual(default.training_schedule, "alternating")
+        self.assertEqual(default.filter_pretrain_epochs, 10)
+        self.assertEqual(default.accumulation_steps, 1)
+        self.assertEqual(default.threshold, 0.2)
+        self.assertEqual(ModelConfig().threshold, 0.2)
+        self.assertEqual(OverfitConfig().threshold, 0.2)
+        with self.assertRaisesRegex(ValueError, "accumulation_steps=1"):
+            replace(default, accumulation_steps=2).validate()
+        replace(default, training_schedule="joint", accumulation_steps=2).validate()
+        with self.assertRaisesRegex(ValueError, "Training schedule"):
+            replace(default, training_schedule="invalid").validate()
 
     def test_disabled_extension_skips_full_field_computation(self):
         model = DNQSM(ModelConfig((2, 4)))
@@ -291,7 +353,9 @@ class FilterPretrainingTests(unittest.TestCase):
             config = replace(
                 self.config(root, make_dataset(root), "legacy"),
                 filter_input_version=1,
+                conditional_laplacian_threshold=0,
                 filter_pretrain_epochs=0,
+                threshold=0.1,
                 full_grid_field=True,
                 residual_filter=True,
                 lambda_extension=1.0,
@@ -300,12 +364,21 @@ class FilterPretrainingTests(unittest.TestCase):
                 directory = run_training(replace(config, max_steps=1))
                 path = directory / "training_last.pt"
                 saved = torch.load(path, weights_only=True)
-                for key in ("filter_input_version", "filter_pretrain_epochs"):
+                for key in (
+                    "filter_input_version",
+                    "filter_pretrain_epochs",
+                    "training_schedule",
+                    "threshold",
+                ):
                     saved["config"].pop(key)
                 saved["model_config"].pop("filter_input_version")
+                saved["model_config"].pop("threshold")
                 torch.save(saved, path)
                 resumed = parse_args(["--resume", str(path), "--max-steps", "0"])
                 self.assertEqual(resumed.filter_pretrain_epochs, 0)
+                self.assertEqual(resumed.training_schedule, "joint")
+                self.assertEqual(resumed.threshold, 0.1)
+                self.assertEqual(load_trained_model(path).config.threshold, 0.1)
                 run_training(resumed)
                 complete = run_training(
                     replace(config, run_dir=str(root / "legacy_whole"))

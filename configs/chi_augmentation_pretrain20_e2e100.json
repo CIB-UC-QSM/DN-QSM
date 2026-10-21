@@ -1,0 +1,161 @@
+{
+  "source_manifest": null,
+  "run_dir": "",
+  "resume": null,
+  "init_checkpoint": "artifacts/runs/dnqsm_laplacian_fp32_finetune100_20261020_001036/model_last.pt",
+  "device": "cuda:0",
+  "cuda_allocator_config": "expandable_segments:True",
+  "epochs": 100,
+  "training_schedule": "joint",
+  "filter_pretrain_epochs": 20,
+  "batch_size": 16,
+  "accumulation_steps": 1,
+  "num_workers": 4,
+  "threads": 4,
+  "learning_rate": 3e-05,
+  "weight_decay": 0.0001,
+  "warmup_epochs": 3,
+  "min_lr_factor": 0.05,
+  "grad_clip": 10.0,
+  "val_fraction": 0.1,
+  "val_views": 3,
+  "synthetic_fraction": 0.25,
+  "crop_probability": 0.2,
+  "crop_resize": true,
+  "chi_augmentation": {
+    "version": 1,
+    "final_grid_rms": true,
+    "bimodal_probability": 0.3333333333333333,
+    "central_probability": 0.3333333333333333,
+    "original_only": true,
+    "cdf_samples": 32768,
+    "quantile_knots": 257,
+    "quantile_tail": 0.001,
+    "min_slope": 0.05,
+    "max_slope": 8.0,
+    "min_span_ppm": 1e-06,
+    "bimodal_negative_mean": [
+      -0.045,
+      -0.025
+    ],
+    "bimodal_positive_mean": [
+      0.008,
+      0.025
+    ],
+    "bimodal_std": [
+      0.003,
+      0.012
+    ],
+    "bimodal_negative_weight": [
+      0.3,
+      0.5
+    ],
+    "bimodal_tail_weight": [
+      0.005,
+      0.04
+    ],
+    "bimodal_tail_mean": [
+      0.06,
+      0.16
+    ],
+    "bimodal_tail_std": [
+      0.02,
+      0.05
+    ],
+    "bimodal_alpha": [
+      0.7,
+      1.0
+    ],
+    "central_mean": [
+      -0.004,
+      0.003
+    ],
+    "central_std": [
+      0.014,
+      0.026
+    ],
+    "central_positive_weight": [
+      0.01,
+      0.05
+    ],
+    "central_positive_mean": [
+      0.07,
+      0.16
+    ],
+    "central_positive_std": [
+      0.02,
+      0.06
+    ],
+    "central_negative_weight": [
+      0.0,
+      0.03
+    ],
+    "central_negative_mean": [
+      -0.12,
+      -0.05
+    ],
+    "central_negative_std": [
+      0.015,
+      0.04
+    ],
+    "central_alpha": [
+      0.2,
+      0.6
+    ]
+  },
+  "chi_shape_validation": true,
+  "seed": 0,
+  "features": [
+    23,
+    47,
+    90
+  ],
+  "threshold": 0.1,
+  "scale_floor": 1e-06,
+  "checkpoint_blocks": true,
+  "residual_filter": false,
+  "full_grid_field": false,
+  "laplacian_input": true,
+  "filter_input_version": 2,
+  "laplacian_fp32": true,
+  "conditional_laplacian_threshold": 32.0,
+  "filter_output_skip": true,
+  "normalize_loss": true,
+  "chi_loss_floor": 0.0001,
+  "field_loss_floor": 0.0001,
+  "mse_input_ratio_cap": 10.0,
+  "lambda_local": 1.5,
+  "lambda_chi": 1.0,
+  "lambda_physics": 1.0,
+  "lambda_extension": 0.0,
+  "physics_warmup_epochs": 0,
+  "background_profile": "mixture",
+  "background_curriculum_epochs": 20,
+  "strong_min_ratio": 0.001,
+  "strong_probability": 0.05,
+  "clean_probability": 0.5,
+  "weak_probability": 0.1,
+  "snr_min": 5.0,
+  "snr_max": 100.0,
+  "validation_synthesis": {
+    "background_mode": "mixture",
+    "clean_probability": 0.15,
+    "weak_probability": 0.1,
+    "strong_probability": 0.25,
+    "strong_min_ratio": 0.001,
+    "snr_min": 40.0,
+    "snr_max": 100.0
+  },
+  "gradient_every": 100,
+  "bf16": true,
+  "comet": true,
+  "comet_project": "dn-qsm",
+  "save_every_steps": 50,
+  "log_every": 1,
+  "max_steps": 0,
+  "max_train_volumes": 0,
+  "max_val_subjects": 0,
+  "evaluate_external": true,
+  "external_eval_every": 1,
+  "sim2_pad": 20
+}

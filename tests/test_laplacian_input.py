@@ -18,7 +18,7 @@ class LaplacianInputTests(unittest.TestCase):
         torch.set_num_threads(2)
 
     def test_impulse_reaches_filter_as_only_exact_laplacian_channel(self):
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0))
         phase = torch.zeros(2, 1, 9, 11, 13)
         phase[0, 0, 4, 5, 6] = 0.02
         phase[1, 0, 4, 5, 6] = 0.1
@@ -50,7 +50,7 @@ class LaplacianInputTests(unittest.TestCase):
         torch.testing.assert_close(physical_channels, expected)
 
     def test_laplacian_has_expected_polynomial_response_interior(self):
-        model = DNQSM(ModelConfig((2, 4))).eval()
+        model = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0)).eval()
         grid = torch.arange(-4, 5, dtype=torch.float32)
         x, y, z = torch.meshgrid(grid, grid, grid, indexing="ij")
         phase = torch.stack((torch.ones_like(x), x * x + y * y + z * z, x * x - y * y))[
@@ -116,6 +116,7 @@ class LaplacianInputTests(unittest.TestCase):
                         laplacian_input=enabled,
                         filter_input_version=version,
                         full_grid_field=version == 1,
+                        conditional_laplacian_threshold=32 if version == 2 else 0,
                     )
                 ).eval()
                 config = asdict(model.config)
@@ -150,7 +151,15 @@ class LaplacianInputTests(unittest.TestCase):
         self.assertTrue(model_config(TrainConfig()).laplacian_input)
         self.assertFalse(
             model_config(
-                parse_args(["--filter-input-version", "1", "--no-laplacian-input"])
+                parse_args(
+                    [
+                        "--filter-input-version",
+                        "1",
+                        "--no-laplacian-input",
+                        "--conditional-laplacian-threshold",
+                        "0",
+                    ]
+                )
             ).laplacian_input
         )
         with tempfile.TemporaryDirectory() as temporary:
@@ -159,6 +168,7 @@ class LaplacianInputTests(unittest.TestCase):
             old_config.pop("laplacian_input")
             old_config.pop("filter_input_version")
             old_config.pop("filter_pretrain_epochs")
+            old_config.pop("conditional_laplacian_threshold")
             torch.save(dict(config=old_config), path)
             resumed = parse_args(["--resume", str(path)])
             self.assertFalse(model_config(resumed).laplacian_input)

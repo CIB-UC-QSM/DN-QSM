@@ -174,7 +174,14 @@ class CorrectiveObjectiveTests(unittest.TestCase):
 
     def test_tkd_uses_full_grid_field_and_legacy_loading_preserves_mask(self):
         _, chi, _, full, mask, dipole = self.example(1)
-        model = DNQSM(ModelConfig((2, 4), full_grid_field=True, filter_input_version=1))
+        model = DNQSM(
+            ModelConfig(
+                (2, 4),
+                full_grid_field=True,
+                filter_input_version=1,
+                conditional_laplacian_threshold=0,
+            )
+        )
         with torch.no_grad():
             model.filter.final.weight.zero_()
             model.filter.final.bias.fill_(1)
@@ -352,6 +359,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             root = Path(temporary)
             config = TrainConfig(
                 filter_pretrain_epochs=0,
+                training_schedule="joint",
                 data_dir=str(make_dataset(root)),
                 cache_dir=str(root / "cache"),
                 run_dir=str(root / "run"),

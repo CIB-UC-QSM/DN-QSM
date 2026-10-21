@@ -41,12 +41,15 @@ class OverfitConfig:
     min_lr_factor: float = 0.05
     grad_clip: float = 10.0
     features: tuple[int, ...] = (54, 108, 216, 432, 864)
-    threshold: float = 0.1
+    threshold: float = 0.2
     checkpoint_blocks: bool = True
     residual_filter: bool = False
     full_grid_field: bool = False
     laplacian_input: bool = True
     filter_input_version: int = 2
+    laplacian_fp32: bool = True
+    conditional_laplacian_threshold: float = 32.0
+    filter_output_skip: bool = True
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -107,6 +110,9 @@ class OverfitConfig:
             full_grid_field=self.full_grid_field,
             laplacian_input=self.laplacian_input,
             filter_input_version=self.filter_input_version,
+            laplacian_fp32=self.laplacian_fp32,
+            conditional_laplacian_threshold=self.conditional_laplacian_threshold,
+            filter_output_skip=self.filter_output_skip,
         )
         LossWeights(
             local=self.lambda_local,
@@ -173,9 +179,15 @@ def _run_overfit(
             != config.laplacian_input
             or resumed["model_config"].get("filter_input_version", 1)
             != config.filter_input_version
+            or resumed["model_config"].get("laplacian_fp32", False)
+            != config.laplacian_fp32
+            or resumed["model_config"].get("conditional_laplacian_threshold", 0.0)
+            != config.conditional_laplacian_threshold
+            or resumed["model_config"].get("filter_output_skip", False)
+            != config.filter_output_skip
         ):
             raise ValueError(
-                "Resume must preserve model capacity, phase-filter input channels, and TKD threshold"
+                "Resume must preserve model capacity, filter input/precision, and TKD threshold"
             )
         if (
             Path(resumed["config"]["cosmos_simulation"]).resolve()
@@ -251,6 +263,9 @@ def _run_overfit(
             full_grid_field=config.full_grid_field,
             laplacian_input=config.laplacian_input,
             filter_input_version=config.filter_input_version,
+            laplacian_fp32=config.laplacian_fp32,
+            conditional_laplacian_threshold=config.conditional_laplacian_threshold,
+            filter_output_skip=config.filter_output_skip,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -596,6 +611,13 @@ def main(argv: list[str] | None = None) -> None:
         values["laplacian_input"] = checkpoint["config"].get("laplacian_input", False)
         values["filter_input_version"] = checkpoint["config"].get(
             "filter_input_version", 1
+        )
+        values["laplacian_fp32"] = checkpoint["config"].get("laplacian_fp32", False)
+        values["conditional_laplacian_threshold"] = checkpoint["config"].get(
+            "conditional_laplacian_threshold", 0.0
+        )
+        values["filter_output_skip"] = checkpoint["config"].get(
+            "filter_output_skip", False
         )
         del checkpoint
     values.update(overrides)

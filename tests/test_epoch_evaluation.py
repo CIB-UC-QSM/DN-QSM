@@ -117,6 +117,7 @@ class EpochEvaluationTests(unittest.TestCase):
                 patch.dict(os.environ, {"COMET_API_KEY": "unit-test-key"}),
                 patch.dict("sys.modules", {"comet_ml": fake}),
                 patch("dnqsm.evaluation.load_cases", return_value=cases),
+                patch("dnqsm.training.filtering_figure", return_value=None),
                 patch("dnqsm.training.reconstruction_figure", return_value=None),
             ):
                 with patch(
