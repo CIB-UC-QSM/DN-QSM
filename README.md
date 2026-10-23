@@ -29,12 +29,26 @@ dependencies and does not require the reference environment.
 
 Volumes use `[N,1,D,H,W]`. Inputs, local fields, and susceptibility use physical
 ppm units and the reference's unshifted continuous dipole kernel convention.
-The initial small baseline uses widths `[16,32,64]` and a 128-channel bottleneck.
-The current twice-baseline profile uses `[23,47,90]` and a 180-channel bottleneck:
-**6,421,407 parameters**, versus 3,212,515 in the baseline (1.999×), both with
-one Laplacian input channel.
-The large overfit profile below uses five wider levels. All use InstanceNorm/CELU
-double-convolution blocks and trilinear upsampling. Inputs are normalized by
+The default training model uses six encoder levels with widths
+`[23,47,90,180,360,720]`, a 1,440-channel bottleneck, and symmetric decoder levels
+in both networks: **410,626,887 parameters** total. Each network contains 33
+convolution layers along its deepest input/output path. The fixed default batch
+size is **10**. This is the deepest measured doubling-width U-Net that fits the
+current GPU; seven levels ran out of memory. See the [capacity measurements](docs/depth_capacity.md).
+The previous three-level profile `[23,47,90]` has 6,421,407 parameters, versus
+3,212,515 for the original `[16,32,64]` baseline, both with one Laplacian input channel.
+The large overfit profile below uses five wider levels. New models use
+InstanceNorm/LeakyReLU double-convolution blocks and trilinear upsampling.
+Every encoder, bottleneck, decoder and optional refinement activation is
+LeakyReLU with negative slope **0.01**, including the activations after decoder
+upsampling convolutions. Output heads remain linear to preserve signed fields.
+`--leaky-relu-slope` overrides the slope for a new training or overfit run; it
+is saved with the model and preserved by exact resume. Missing slope metadata
+defaults to 0.01 for older checkpoints.
+The activation is recorded in checkpoints; historical checkpoints without this
+metadata retain CELU for inference and exact resume. To adapt existing weights
+to LeakyReLU, start a new run with `--init-checkpoint` and the new defaults.
+Inputs are normalized by
 masked RMS, and outputs are rescaled to ppm.
 
 1. The main model accepts `total_field`, the ROI `mask`, and the `dipole` kernel.
@@ -53,18 +67,20 @@ masked RMS, and outputs are rescaled to ppm.
    Changing preprocessing on pretrained
    weights requires a new adaptation experiment, not an exact resume.
    The total-RMS branch uses `field = total_field * mask`, `u = field/scale`, and
-   `local = scale * filter(Laplacian(u), u) * mask`. By default, samples with a
+   `L = Laplacian(u)` and `local = scale * filter(L, u) * mask`.
+   By default, samples with a
    total/interior-Laplacian RMS ratio of at least 32 use the conditional scaling
    described below. The mask is applied before the
    Laplacian and again before TKD, with no fixed original-field addition.
-   Immediately before the final 1×1×1 convolution, the decoder features are
-   concatenated along channels with `field / selected_scale`: the original
-   masked total field, using the same total or conditional RMS scale as the
-   processed features. This final convolution learns how to combine both inputs.
-   The added raw-field weight starts at zero and can receive gradients from the
-   first update. `filter_output_skip=true` is the default for new models;
-   `--no-filter-output-skip` selects the earlier output head. This adds one
-   parameter to the phase filter; the null-space U-Net uses its existing head.
+   Immediately before the final 1×1×1 convolution, decoder features are
+   concatenated along channels with `field / selected_scale`, the original
+   masked input field normalized with the selected total or conditional RMS.
+   The output head learns how to combine these inputs. Its raw-field coefficient
+   starts at zero and receives gradients from the first update.
+   The defaults are `filter_output_skip=true`,
+   `filter_laplacian_residual=false`, and `filter_refinement_features=0`.
+   The Laplacian-sum and ResNet-refinement variants remain supported for loading
+   their saved checkpoints, but are disabled in new default runs.
    New models record `filter_input_version=2`; incompatible residual, full-grid,
    or raw-field input flags are rejected. Historical checkpoints retain their
    original channels and field behavior when evaluated or exactly resumed.
@@ -87,32 +103,54 @@ the TKD frequency content compared with the historical full-grid architecture.
 Susceptibility and projected correction remain unmasked on the FFT grid to
 preserve the correction's Fourier support. Use masked exports for ROI analysis.
 
-The three ROI penalties are dimensionless and normalized independently per sample.
+The four ROI penalties are dimensionless and normalized independently per sample.
 `s_chi` and `s_b` are detached ground-truth susceptibility and clean-local-field
 masked RMS, clamped by `--chi-loss-floor` and `--field-loss-floor` (both `1e-4`
 ppm). Neither the total field nor a prediction sets these scales:
 
 ```text
-loss = lambda_physics * masked_MSE(A(chi), local_gt) / s_b**2
-     + lambda_local   * masked_MAE(local, local_gt)  / s_b
+loss = lambda_local   * masked_MAE(local, local_gt)  / s_b
+     + lambda_local_gradient * ROI_edge_MAE(grad(local), grad(local_gt)) / s_b
+     + lambda_local_tkd * masked_MAE(TKD(local), chi_gt) / s_chi
      + lambda_chi     * masked_MAE(chi, chi_gt)      / s_chi
+     + lambda_physics * masked_MSE(A(chi), local_gt) / s_b**2
 ```
 
-Default weights are `local=1.5`, `chi=physics=1.0`, and `extension=0`.
-Phase-only updates use the local term with coefficient 1.5. Chi-only updates
-use the chi and physics terms with coefficient 1.0 each. Validation reports the
-combined objective shown above. Exterior supervision is disabled
+Default weights are `local=1.5`, `local_gradient=chi=physics=1.0`, `extension=0`,
+and `local_tkd=0`.
+The gradient term compares forward differences along all three spatial axes
+using unit voxel steps. It averages over neighbor pairs with both voxels inside
+the ROI, pooling valid edges across axes per sample. It uses no padding or
+wraparound and excludes artificial mask-boundary edges. Samples with no valid
+pairs contribute zero. Its normalization uses the detached clean-field RMS,
+and computation stays FP32. `--lambda-local-gradient` controls its weight;
+zero disables both the term and its computation.
+`--lambda-local-tkd` penalizes the hard-cutoff inversion of the **predicted**
+local field against ground-truth susceptibility. Inverting the retained band
+multiplies it by `1/abs(D)`, up to `1/tau`, so a voxelwise field penalty charges
+the same price for every spatial frequency while the inversion does not. This
+term weights the filter's error by the conditioning of the operator that
+consumes it. The full pipeline reuses the reconstruction's own `tkd` output
+rather than repeating the transform pair; filtering-only batches compute it
+with `local_tkd_loss`. Its normalization uses the detached susceptibility RMS.
+Zero disables both the term and its computation, which is the default.
+
+Phase-only updates use the local, local-gradient, local-TKD, and exterior
+terms; these are the only batches that update the filter under the alternating
+schedule, so every filter objective has to be computed there. Chi-only updates
+use chi and physics terms with coefficient 1.0 each. Validation reports the
+combined objective shown above. Forward-field error remains a diagnostic metric.
+Exterior supervision is disabled
 and its computation is skipped. Historical runs can retain their existing
 exterior objective. Reductions average voxels per sample, then
-samples. `--no-normalize-loss` provides a raw-loss ablation. `lambda_physics`
-compares directly with the **ground-truth clean local field**, independently
-penalizing a susceptibility/filter pair that agrees on the wrong field.
+samples. `--no-normalize-loss` provides a raw-loss ablation. The physics term is masked MSE of
+`A(chi)` against the **ground-truth clean local field**, divided by `s_b**2`.
 The penalty comparing `A(chi)` with the estimated local field has been removed;
 its weight and training diagnostics are no longer exposed.
-Physics and losses stay FP32 even when eligible GPU convolutions use BF16.
+Forward physics and losses stay FP32 even when eligible GPU convolutions use BF16.
 The CNN and its output head use BF16 under CUDA autocast; the fixed Laplacian
-preprocessing uses FP32 for new models. Physics-weight warmup is disabled by default. Optional
-`--physics-warmup-epochs` ramps only the physics term; validation always uses
+preprocessing uses FP32 for new models. Physics-weight warmup is disabled by default.
+`--physics-warmup-epochs` optionally ramps its weight; validation uses
 the final coefficients.
 
 ```python
@@ -154,7 +192,17 @@ RMS/noise RMS SNR of 40–100. The default background mixture contains 15% clean
 Over five epochs, `--background-curriculum-epochs` ramps the strong fraction
 and lowers its minimum ratio. Unused strong probability initially becomes typical
 background probability. Fractions and `--strong-min-ratio` are configurable;
-`--background-profile ratio` and `legacy` provide ablations. At fixed sample
+`--background-profile ratio` and `legacy` provide ablations.
+
+The mixture's **amplitude** fractions do not determine what the filter actually
+sees, because its input channel is a Laplacian and the synthesized exterior
+sources are far smoother than the field they are meant to stand in for. Audit
+the realized regime with `scripts/audit_background_regime.py --config <json>`,
+which reports the background/local amplitude ratio and the ratio of the two
+fields' interior Laplacians, alongside both external cases for reference. The
+Laplacian ratio is the filter's actual input SNR and is the figure to match.
+
+At fixed sample
 seeds, RNG streams are independent of batch construction; strongly amplified
 backgrounds can expose small FP32 FFT rounding differences across batch sizes.
 The clean local target is recomputed from susceptibility; no sparse impulses
@@ -236,7 +284,7 @@ Non-cubic crops are scaled independently along each axis to fill the cube.
 Unselected samples, validation, external evaluation, and source files are unchanged.
 
 Cropping and interpolation happen **before** field synthesis: clean fields,
-backgrounds, noise, TKD kernels, and physics losses all use the same 160³ grid.
+backgrounds, noise, TKD kernels, and forward-field metrics all use the same 160³ grid.
 With the standard 160³ source data, cropped and uncropped samples stack together
 in one `[N,1,160,160,160]` tensor and share one model forward pass.
 `--no-crop-resize` retains the previous native-crop behavior, grouping different
@@ -253,7 +301,7 @@ uv run dnqsm-train --device cuda:0 --comet \
 The default run starts with **10 filtering-only epochs**, followed by **50
 alternating epochs**. `--epochs` counts epochs after pretraining;
 `--filter-pretrain-epochs 0` disables pretraining. Pretraining calls only the
-filter, using `lambda_local * normalized_ROI_MAE`; TKD and the susceptibility
+filter, using local-field L1 and gradient-matching L1 losses; TKD and the susceptibility
 network are bypassed.
 
 After pretraining, the first batch updates only the phase filter with the same
@@ -264,7 +312,7 @@ boundaries, including epochs with an odd number of batches. Frozen networks are
 in evaluation mode and receive no gradients; their weights and Adam moments stay unchanged.
 Validation evaluates the full reconstruction after every alternating epoch.
 
-Both stages use batch size 1, AdamW at `1e-4`, weight decay `1e-4`, three warmup
+Both stages use batch size 10, AdamW at `1e-4`, weight decay `1e-4`, three warmup
 epochs, cosine decay to `5e-6`, and gradient clipping at 10. The default
 `--accumulation-steps 1` gives one optimizer update per batch; alternating
 training requires this setting. `--training-schedule joint` retains the joint
@@ -273,7 +321,12 @@ Adam moments carry across the pretraining boundary. The warmup/cosine schedule
 restarts at that boundary, and optional physics-weight warmup starts there.
 Global sampling epochs, background curriculum, and update counts continue
 across the transition. CUDA convolutions use BF16 when supported.
-Activation checkpointing is enabled. Check GPU occupancy before a full run.
+Activation checkpointing is enabled. The new profile
+`configs/deep_alternating_batch10.json` uses the measured six-level architecture
+and the latest susceptibility augmentation with 10 pretraining plus 100
+alternating epochs. Changing depth requires fresh initialization; shallower
+checkpoints retain their recorded architecture and cannot be exactly resumed
+into the deeper model. Check GPU occupancy before a full run.
 `--cuda-memory-gb 12` sets an 11 GiB PyTorch allocator ceiling and reserves
 1 GiB for CUDA context/library allocations. Zero leaves the allocator unlimited.
 The initial experiment used the 12 GiB budget to share the GPU. The current
@@ -341,7 +394,7 @@ Exact resume preserves interpolation, loss floors/weights and warmup, curriculum
 input/masking architecture, pretraining duration, training schedule, TKD threshold,
 and validation definition.
 It works within either phase and at the transition. Checkpoints record loss
-version **4**, which removes predicted-local-field consistency. Earlier
+version **6**, which adds TKD supervision of the predicted local field. Earlier
 objectives require a new run with `--init-checkpoint`; their optimizer and
 scheduler cannot silently resume with a different objective.
 Historical checkpoints retain their original channels, masking, and residual
@@ -352,10 +405,15 @@ the next branch from the saved epoch and batch cursor. To reuse weights with a m
 a separate experiment with `--init-checkpoint <run>/model_last.pt`;
 this resets the optimizer, scheduler, and training cursor and preserves the old
 run's history. Do not initialize a full run from COSMOS-overfitted weights.
-When this new experiment enables the output skip on an older compatible filter,
-`--init-checkpoint` copies its existing weights and appends a zero-initialized
-raw-field coefficient to the output head. Historical inference and exact resume
-keep their original head (`filter_output_skip=false` when the flag is absent).
+Compatible filters without concatenation can initialize the concatenation head
+by appending a zero raw-field coefficient. A different Laplacian-residual policy
+requires a fresh run. Historical inference and exact resume
+keep the original head and prediction rule (`filter_output_skip=false` and
+`filter_laplacian_residual=false` when the respective flags are absent).
+Checkpoints without `filter_refinement_features` retain their original output
+without refinement. A new run with `--init-checkpoint` can append the identity
+refinement to a compatible model; an existing trained block cannot be silently
+removed or resized. Exact resume preserves its saved width.
 
 Portable corrective profiles are in `configs/corrective_200epochs.json` and
 `configs/corrective_ablation.json`. `--config` loads JSON for a new experiment;
@@ -371,6 +429,27 @@ plus five alternating epochs.
 These profiles do not start or modify an existing run. Before a new long run,
 repeat the fixed-case overfit gate and compare short ablations across seeds.
 Re-profile VRAM using the updated architecture and sampled gradient diagnostics.
+
+`configs/background_regime_100epochs.json` re-centres training on the background
+regime the external benchmarks occupy: 5% clean, 5% weak, 50% typical, and 40%
+strong backgrounds with `--strong-min-ratio 0.005`. Audited over a sampler
+epoch that yields a median background/local RMS ratio of 35 and places 64% of
+samples at or above 10, against 5.1 and 14% for the preceding profile; COSMOS
+is at 22. Its `validation_synthesis` object matches, so checkpoint selection
+targets the same regime, which makes its `validation` series incomparable with
+earlier runs. `validation_stress` is unchanged and remains the cross-run anchor.
+`configs/background_regime_ablation.json` is the bounded matched arm: 400
+filtering-only updates from a supplied `init_checkpoint`, sharing that
+validation suite so two mixtures differ only in what they train on.
+
+`configs/fullgrid_tkd02.json` adds the unmasked architecture to that mixture:
+`full_grid_field` with `filter_input_version=1`, `lambda_extension=1`,
+`--threshold 0.2`, and `--lambda-local-tkd 1`. Version 1 gives the filter the
+normalized field as a second input channel and forbids conditional Laplacian
+scaling, so `--conditional-laplacian-threshold 0` is required. Masking the
+predicted field before TKD applies a full-grid operator to a truncated field;
+on COSMOS that costs about 15 percentage points of susceptibility NRMSE that
+training cannot recover, measured against the exact clean field.
 
 `configs/balanced_local_total_100epochs.json` targets both noisy local and total
 fields: 50% have no background, 10% weak, 35% typical, and 5% strong backgrounds
@@ -408,7 +487,7 @@ three fixed views each; they do not establish converged or clinical performance.
 The external COSMOS advantage did not repeat across seeds. Use
 `--conditional-laplacian-threshold 0` for a comparison with total-RMS scaling;
 this is also required when selecting a historical version-1 architecture.
-InstanceNorm and the existing physics loss remain the defaults. The experiment
+InstanceNorm and physics loss remain the defaults. The experiment
 runner is `scripts/normalization_ablation.py`; complete local evidence is in
 `artifacts/diagnostics/normalization_ablation_20261019/`.
 
@@ -472,17 +551,17 @@ every update, with no augmentation or new noise. The large overfit default is
 250 updates with five encoder levels `[54,108,216,432,864]`, a 1,728-channel
 bottleneck, and **590,872,215 trainable parameters** across the two U-Nets.
 The former `[16,32,64]` model has 3,212,515 parameters. The sequential
-U-Net/TKD/projected-correction architecture uses the three normalized ROI terms.
+U-Net/TKD/projected-correction architecture uses the four normalized ROI terms.
 This step-based diagnostic trains the complete model from its first update;
 independent pretraining belongs to the full training loop.
 
 AdamW uses `1e-3`, zero weight decay, a memory-efficient per-tensor update
 (`foreach=False`), and cosine decay to 5% of the initial rate. BF16 convolutions,
-FP32 physics/losses, and activation checkpointing control memory. The three active loss
+FP32 physics/losses, and activation checkpointing control memory. The four active loss
 weights can be overridden independently. Use `--features 16 32 64 --steps 2000`
 for the former small-model experiment settings.
-Overfit physics-weight warmup is also disabled by default; optional
-`--physics-warmup-steps` enables a ramp.
+Overfit physics loss is enabled by default; `--physics-warmup-steps` optionally
+ramps its weight.
 Its fit gate always measures the final fixed objective, so changing warmup
 weights cannot manufacture a passing loss reduction. `--gradient-every 50`
 records per-objective gradient norms/cosines without updating optimizer state.
@@ -543,6 +622,14 @@ without the old solver factor `0.264`. DN-QSM does not consume the old solver's
 fidelity-weight map. Cropping follows the reference's index alignment even
 though the supplied phase array is larger than the mask. NIfTI outputs restore
 the mask's original shape and susceptibility reference affine.
+
+sim2's supplied phase is **not** the dipole forward field of its reference
+susceptibility: they differ by roughly 51% NRMSE, masking the reference changes
+nothing (0.02% of its susceptibility energy lies outside the mask), and the
+residual is rough rather than a smooth background. Every sim2 case therefore
+records `forward_consistency_nrmse` in its metadata so the benchmark's own
+inconsistency travels with the score it bounds. Treat sim2 as an
+out-of-model-class consistency check; it does not select checkpoints.
 
 Evaluation reports final and TKD susceptibility NRMSE, consistency MSE against
 the predicted pre-TKD field (`forward_mse`), and inference time. COSMOS also
