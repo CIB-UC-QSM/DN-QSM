@@ -50,7 +50,14 @@ def main():
             )
             experimental = (
                 ExperimentModel(
-                    ModelConfig(**saved["model_config"]),
+                    ModelConfig(
+                        **{
+                            **saved["model_config"],
+                            "activation": saved["model_config"].get(
+                                "activation", "celu"
+                            ),
+                        }
+                    ),
                     source["model"],
                     saved["variant"],
                 )
@@ -63,6 +70,9 @@ def main():
                 laplacian_fp32=True,
                 conditional_laplacian_threshold=32.0,
                 filter_output_skip=False,
+                filter_laplacian_residual=False,
+                filter_refinement_features=0,
+                activation=saved["model_config"].get("activation", "celu"),
             )
             export = path.parent / "model_production.pt"
             atomic_save(
@@ -139,7 +149,14 @@ def main():
                 path.parent / "model.pt", weights_only=True, map_location="cpu"
             )
             model = ExperimentModel(
-                ModelConfig(**saved["model_config"]), source["model"], saved["variant"]
+                ModelConfig(
+                    **{
+                        **saved["model_config"],
+                        "activation": saved["model_config"].get("activation", "celu"),
+                    }
+                ),
+                source["model"],
+                saved["variant"],
             )
             model.load_state_dict(saved["model"])
             model = model.cuda().eval()

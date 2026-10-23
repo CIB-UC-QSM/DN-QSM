@@ -66,6 +66,7 @@ class PhysicsAndModelTests(unittest.TestCase):
                     (2, 4),
                     residual_filter=residual,
                     filter_input_version=1,
+                    filter_laplacian_residual=False,
                     conditional_laplacian_threshold=0,
                 )
             )
@@ -121,7 +122,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         loss, terms = reconstruction_loss(
             prediction, local_gt, chi_gt, mask, dipole, weights, normalization=None
         )
-        self.assertEqual(set(terms), {"physics", "local", "chi"})
+        self.assertEqual(set(terms), {"physics", "local", "local_gradient", "chi"})
         torch.testing.assert_close(
             loss,
             sum(getattr(weights, name) * value for name, value in terms.items()),
@@ -133,6 +134,33 @@ class PhysicsAndModelTests(unittest.TestCase):
         self.assertGreater(float(local.grad.abs().sum()), 0)
         self.assertGreater(float(chi.grad.abs().sum()), 0)
         self.assertTrue(bool((local.grad[mask == 0] == 0).all()))
+
+    def test_disabled_physics_objective_excludes_physics_gradients(self):
+        shape = (8, 10, 12)
+        chi = torch.linspace(0.01, 0.03, steps=8 * 10 * 12).reshape(1, 1, *shape)
+        chi.requires_grad_()
+        local = torch.full_like(chi, 0.03, requires_grad=True)
+        mask = torch.zeros_like(chi)
+        mask[..., 1:-1, 1:-1, 1:-1] = 1
+        dipole = dipole_tensor(shape)
+        prediction = Reconstruction(local, chi, chi * 0, chi)
+        clean = torch.zeros_like(chi)
+        loss, terms = reconstruction_loss(
+            prediction,
+            clean,
+            clean,
+            mask,
+            dipole,
+            weights=LossWeights(physics=0, extension=0),
+            normalization=None,
+        )
+        torch.testing.assert_close(
+            loss, 1.5 * terms["local"] + terms["local_gradient"] + terms["chi"]
+        )
+        self.assertGreater(float(terms["physics"].detach()), 0)
+        loss.backward()
+        torch.testing.assert_close(local.grad, 1.5 * mask / mask.sum())
+        torch.testing.assert_close(chi.grad, mask / mask.sum())
 
     def test_clean_field_physics_penalizes_jointly_biased_predictions(self):
         shape = (8, 10, 12)

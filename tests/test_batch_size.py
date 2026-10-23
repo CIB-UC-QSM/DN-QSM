@@ -63,6 +63,7 @@ class BatchSizeTests(unittest.TestCase):
                 cache_dir=str(root / "cache"),
                 device="cpu",
                 features=(2, 4),
+                batch_size=1,
                 bf16=False,
                 num_workers=0,
                 threads=2,

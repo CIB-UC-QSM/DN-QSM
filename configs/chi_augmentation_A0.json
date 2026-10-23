@@ -1,4 +1,5 @@
 {
+  "activation": "leaky_relu",
   "source_manifest": null,
   "run_dir": "",
   "resume": null,
@@ -41,6 +42,7 @@
   "field_loss_floor": 0.0001,
   "mse_input_ratio_cap": 10.0,
   "lambda_local": 1.5,
+  "lambda_local_gradient": 1.0,
   "lambda_chi": 1.0,
   "lambda_physics": 1.0,
   "lambda_extension": 0.0,
@@ -73,9 +75,12 @@
   "max_val_subjects": 0,
   "evaluate_external": false,
   "external_eval_every": 0,
+  "evaluation_data_dir": "",
   "sim2_pad": 20,
   "chi_shape_validation": true,
   "conditional_laplacian_threshold": 32.0,
   "filter_output_skip": true,
+  "filter_laplacian_residual": false,
+  "filter_refinement_features": 0,
   "chi_augmentation": null
 }

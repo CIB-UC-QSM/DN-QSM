@@ -81,8 +81,16 @@ class FilterOutputSkipTests(unittest.TestCase):
         self.assertGreater(float(model.filter.final.weight.grad[:, -1].abs().sum()), 0)
 
     def test_warm_start_zero_extends_head_and_preserves_old_weights(self):
-        old = DNQSM(ModelConfig((2, 4), filter_output_skip=False)).eval()
-        new = DNQSM(ModelConfig((2, 4))).eval()
+        old = DNQSM(
+            ModelConfig(
+                (2, 4), filter_output_skip=False, filter_laplacian_residual=False
+            )
+        ).eval()
+        new = DNQSM(
+            ModelConfig(
+                (2, 4), filter_output_skip=True, filter_laplacian_residual=False
+            )
+        ).eval()
         original = old.filter.final.weight.detach().clone()
         new.initialize_from(old)
         torch.testing.assert_close(
@@ -102,8 +110,15 @@ class FilterOutputSkipTests(unittest.TestCase):
         field, mask = self.fields()
         with tempfile.TemporaryDirectory() as temporary:
             for enabled in (False, True):
-                model = DNQSM(ModelConfig((2, 4), filter_output_skip=enabled)).eval()
+                model = DNQSM(
+                    ModelConfig(
+                        (2, 4),
+                        filter_output_skip=enabled,
+                        filter_laplacian_residual=False,
+                    )
+                ).eval()
                 config = asdict(model.config)
+                config.pop("filter_laplacian_residual")
                 if not enabled:
                     config.pop("filter_output_skip")
                 else:

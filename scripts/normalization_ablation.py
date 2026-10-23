@@ -100,7 +100,14 @@ class ResidualBlock(nn.Module):
 class ExperimentModel(DNQSM):
     def __init__(self, config, state, variant):
         # These recorded ablations predate the raw-field output skip.
-        super().__init__(replace(config, filter_output_skip=False))
+        super().__init__(
+            replace(
+                config,
+                filter_output_skip=False,
+                filter_laplacian_residual=False,
+                filter_refinement_features=0,
+            )
+        )
         self.load_state_dict(state)
         self.variant = variant
         branch = self.null_network if variant == "null_edge_none" else self.filter
@@ -302,11 +309,22 @@ def main():
             "filter_output_skip": saved["model_config"].get(
                 "filter_output_skip", False
             ),
+            "filter_laplacian_residual": saved["model_config"].get(
+                "filter_laplacian_residual", False
+            ),
+            "filter_refinement_features": saved["model_config"].get(
+                "filter_refinement_features", 0
+            ),
+            "activation": saved["model_config"].get("activation", "celu"),
         }
     )
-    if model_config.filter_output_skip:
+    if (
+        model_config.filter_output_skip
+        or model_config.filter_laplacian_residual
+        or model_config.filter_refinement_features
+    ):
         raise ValueError(
-            "These ablations require a checkpoint without the filter output skip"
+            "These ablations require a checkpoint without an output skip, Laplacian residual, or refinement block"
         )
     if model_config.filter_input_version != 2:
         raise ValueError("Experiments require the masked Laplacian-only architecture")
@@ -339,7 +357,7 @@ def main():
     )
     synthesizer = ShapeFieldSynthesizer(device)
     normalization = LossNormalization(mse_input_ratio_cap=config["mse_input_ratio_cap"])
-    weights = LossWeights(local=1.5, chi=1, physics=1, extension=0)
+    weights = LossWeights(local=1.5, chi=1, physics=1, extension=0, local_gradient=0)
     manifest = dict(
         checkpoint=str(checkpoint),
         checkpoint_step=saved["step"],

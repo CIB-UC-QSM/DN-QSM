@@ -139,15 +139,20 @@ class FilterPretrainingTests(unittest.TestCase):
                     self.assertNotIn("chi", row)
                     self.assertEqual(row["active_physics_weight"], 0)
                     self.assertAlmostEqual(
-                        row["loss"], config.lambda_local * row["local"], places=6
+                        row["loss"],
+                        config.lambda_local * row["local"]
+                        + config.lambda_local_gradient * row["local_gradient"],
+                        delta=1e-6 * max(1, abs(row["loss"])),
                     )
                 else:
+                    self.assertNotIn("local_gradient", row)
                     self.assertAlmostEqual(
                         row["loss"],
                         config.lambda_chi * row["chi"]
                         + config.lambda_physics * row["physics"],
-                        places=6,
+                        delta=1e-6 * max(1, abs(row["loss"])),
                     )
+                    self.assertEqual(row["active_physics_weight"], 1)
                     self.assertEqual(row["grad_filter_local"], 0)
                     self.assertGreater(row["grad_null_network_chi"], 0)
             validation = [row for row in rows if row["event"] == "validation"]
@@ -347,12 +352,46 @@ class FilterPretrainingTests(unittest.TestCase):
         self.assertNotIn("extension", terms)
         loss.backward()
 
+    def test_filtering_batches_supervise_the_exterior_they_alone_can_learn(self):
+        # Filtering-only batches are the only ones that update the filter under
+        # the alternating schedule, and chi branches zero the extension weight.
+        # If this path drops the term, exterior supervision reaches no batch at
+        # all and the full-grid field is trained against nothing outside the ROI.
+        from dnqsm.training import _predict_training_batch
+
+        model = DNQSM(
+            ModelConfig(
+                (2, 4),
+                full_grid_field=True,
+                filter_input_version=1,
+                conditional_laplacian_threshold=0.0,
+            )
+        )
+        field = torch.randn(1, 1, 12, 12, 12) * 0.01
+        mask = torch.zeros_like(field)
+        mask[..., 2:-2, 2:-2, 2:-2] = 1
+        data = dict(
+            phase=field * mask,
+            local=field * mask,
+            chi=field * mask,
+            mask=mask,
+            dipole=dipole_tensor(field.shape[-3:]),
+            local_full=field,
+        )
+        device = torch.device("cpu")
+        _, raw, _ = _predict_training_batch(model, data, device, False, True, True)
+        self.assertIn("extension", raw)
+        self.assertGreater(float(raw["extension"].detach().sum()), 0)
+        _, without, _ = _predict_training_batch(model, data, device, False, True, False)
+        self.assertNotIn("extension", without)
+
     def test_legacy_training_resume_keeps_old_model_and_zero_pretraining(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
             root = Path(temp)
             config = replace(
                 self.config(root, make_dataset(root), "legacy"),
                 filter_input_version=1,
+                filter_laplacian_residual=False,
                 conditional_laplacian_threshold=0,
                 filter_pretrain_epochs=0,
                 threshold=0.1,

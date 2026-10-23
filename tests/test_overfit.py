@@ -73,6 +73,21 @@ class OverfitTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "already exhausted"):
                 run_overfit(continued)
+            with self.assertRaisesRegex(ValueError, "Resume must preserve"):
+                run_overfit(
+                    replace(
+                        continued,
+                        steps=5,
+                        filter_output_skip=False,
+                        filter_laplacian_residual=True,
+                    )
+                )
+            with self.assertRaisesRegex(ValueError, "Resume must preserve"):
+                run_overfit(replace(continued, steps=5, filter_refinement_features=16))
+            with self.assertRaisesRegex(ValueError, "Resume must preserve"):
+                run_overfit(replace(continued, steps=5, activation="celu"))
+            with self.assertRaisesRegex(ValueError, "Resume must preserve"):
+                run_overfit(replace(continued, steps=5, leaky_relu_slope=0.3))
 
     def test_cli_fails_when_sanity_gate_is_not_met(self):
         with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):

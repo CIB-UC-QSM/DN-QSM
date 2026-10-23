@@ -127,6 +127,7 @@ def arm_step(model, batch, synthesizer, optimizer, config, arm, *, diagnostics=F
             data["dipole"],
             predicted_field=predicted_field,
             include_extension=False,
+            include_gradient=bool(weights.local_gradient),
         )
         normalized = normalize_loss_terms(
             raw,
@@ -284,7 +285,12 @@ def make_anchor(study, seed, config):
         return anchor
     model = load_trained_model(study / "phase_pretrain20.pt", "cpu")
     torch.manual_seed(seed)
-    model.null_network = UNet3D(model.config.features, model.config.checkpoint_blocks)
+    model.null_network = UNet3D(
+        model.config.features,
+        model.config.checkpoint_blocks,
+        activation=model.config.activation,
+        leaky_relu_slope=model.config.leaky_relu_slope,
+    )
     atomic_save(
         dict(
             version=CHECKPOINT_VERSION,
@@ -678,7 +684,9 @@ def main(argv=None):
     except BlockingIOError:
         raise SystemExit("This study already has an active experiment runner") from None
     manifest = json.loads((study / "manifest.json").read_text())
-    config = TrainConfig(**json.loads(Path(manifest["pretrain_config"]).read_text()))
+    config_values = json.loads(Path(manifest["pretrain_config"]).read_text())
+    config_values.setdefault("lambda_local_gradient", 0.0)
+    config = TrainConfig(**config_values)
     config.validate()
     if config.accumulation_steps != 1 or config.lambda_extension:
         raise ValueError("The study requires accumulation=1 and no extension loss")

@@ -38,7 +38,7 @@ from .losses import (
     per_sample_loss_terms,
 )
 from .memory import ProcessMemoryMonitor
-from .model import DNQSM, ModelConfig
+from .model import DEFAULT_FEATURES, DNQSM, ModelConfig
 from .paths import RUNS_DIR, TRAINING_CACHE_DIR, TRAINING_DATA_DIR
 from .physics import apply_dipole, masked_nrmse
 from .runtime import (
@@ -67,7 +67,7 @@ class TrainConfig:
     epochs: int = 50
     filter_pretrain_epochs: int = 10
     training_schedule: str = "alternating"
-    batch_size: int = 1
+    batch_size: int = 10
     accumulation_steps: int = 1
     num_workers: int = 4
     threads: int = 4
@@ -84,7 +84,7 @@ class TrainConfig:
     chi_augmentation: dict | None = None
     chi_shape_validation: bool = False
     seed: int = 0
-    features: tuple[int, ...] = (16, 32, 64)
+    features: tuple[int, ...] = DEFAULT_FEATURES
     threshold: float = 0.2
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = True
@@ -95,14 +95,20 @@ class TrainConfig:
     laplacian_fp32: bool = True
     conditional_laplacian_threshold: float = 32.0
     filter_output_skip: bool = True
+    filter_laplacian_residual: bool = False
+    filter_refinement_features: int = 0
+    activation: str = "leaky_relu"
+    leaky_relu_slope: float = 0.01
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
     mse_input_ratio_cap: float = 0.0
     lambda_local: float = 1.5
+    lambda_local_gradient: float = 1.0
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
     lambda_extension: float = 0.0
+    lambda_local_tkd: float = 0.0
     physics_warmup_epochs: int = 0
     background_profile: str = "mixture"
     background_curriculum_epochs: int = 5
@@ -207,12 +213,18 @@ class TrainConfig:
             self.laplacian_fp32,
             self.conditional_laplacian_threshold,
             self.filter_output_skip,
+            self.filter_laplacian_residual,
+            self.filter_refinement_features,
+            self.activation,
+            self.leaky_relu_slope,
         )
         LossWeights(
             local=self.lambda_local,
+            local_gradient=self.lambda_local_gradient,
             chi=self.lambda_chi,
             physics=self.lambda_physics,
             extension=self.lambda_extension,
+            local_tkd=self.lambda_local_tkd,
         )
         LossNormalization(
             self.chi_loss_floor, self.field_loss_floor, self.mse_input_ratio_cap
@@ -265,6 +277,10 @@ def model_config(config: TrainConfig) -> ModelConfig:
         config.laplacian_fp32,
         config.conditional_laplacian_threshold,
         config.filter_output_skip,
+        config.filter_laplacian_residual,
+        config.filter_refinement_features,
+        config.activation,
+        config.leaky_relu_slope,
     )
 
 
@@ -281,9 +297,11 @@ def normalization_config(config):
 def training_weights(config, step=0, warmup_steps=0):
     weights = LossWeights(
         local=config.lambda_local,
+        local_gradient=config.lambda_local_gradient,
         chi=config.lambda_chi,
         physics=config.lambda_physics,
         extension=config.lambda_extension,
+        local_tkd=config.lambda_local_tkd,
     )
     if warmup_steps:
         weights = replace(
@@ -371,12 +389,27 @@ def checkpoint_training_config(saved: dict) -> dict:
     values.setdefault("laplacian_fp32", False)
     values.setdefault("conditional_laplacian_threshold", 0.0)
     values.setdefault("filter_output_skip", False)
+    values.setdefault("filter_laplacian_residual", False)
+    values.setdefault("filter_refinement_features", 0)
+    values.setdefault("activation", "celu")
+    values.setdefault("leaky_relu_slope", 0.01)
+    values.setdefault("lambda_local_gradient", 0.0)
+    values.setdefault("lambda_local_tkd", 0.0)
     values.setdefault("chi_augmentation", None)
     values.setdefault("chi_shape_validation", False)
     return values
 
 
-def _predict_training_batch(model, data, device, bf16, filter_only, include_extension):
+def _predict_training_batch(
+    model,
+    data,
+    device,
+    bf16,
+    filter_only,
+    include_extension,
+    include_gradient=True,
+    include_tkd=False,
+):
     with autocast_context(device, bf16):
         output = (
             model.predict_local_field(data["phase"], data["mask"])
@@ -384,7 +417,23 @@ def _predict_training_batch(model, data, device, bf16, filter_only, include_exte
             else model(data["phase"], data["mask"], data["dipole"])
         )
     if filter_only:
-        return output, local_field_loss_terms(output, data["local"], data["mask"]), None
+        # Filtering-only batches are the only ones that update the filter under
+        # the alternating schedule, so exterior and TKD supervision have to
+        # reach it here or they reach it nowhere.
+        return (
+            output,
+            local_field_loss_terms(
+                output,
+                data["local"],
+                data["mask"],
+                include_gradient=include_gradient,
+                local_full_target=data["local_full"] if include_extension else None,
+                chi_target=data["chi"] if include_tkd else None,
+                dipole=data["dipole"] if include_tkd else None,
+                threshold=model.config.threshold if include_tkd else None,
+            ),
+            None,
+        )
     predicted_field = apply_dipole(output.chi, data["dipole"])
     raw = per_sample_loss_terms(
         output,
@@ -395,6 +444,8 @@ def _predict_training_batch(model, data, device, bf16, filter_only, include_exte
         local_full_target=data["local_full"],
         predicted_field=predicted_field,
         include_extension=include_extension,
+        include_gradient=include_gradient,
+        include_tkd=include_tkd,
     )
     return output, raw, predicted_field
 
@@ -510,7 +561,14 @@ def backward_batch(
         count = data["chi"].shape[0]
         fraction = count / group_samples
         output, raw, predicted_field = _predict_training_batch(
-            model, data, device, config.bf16, filter_only, bool(weights.extension)
+            model,
+            data,
+            device,
+            config.bf16,
+            filter_only,
+            bool(weights.extension),
+            include_gradient=bool(weights.local_gradient) and not chi_only,
+            include_tkd=bool(weights.local_tkd) and not chi_only,
         )
         terms = {
             name: value.mean()
@@ -526,7 +584,11 @@ def backward_batch(
         loss = sum(
             getattr(weights, name) * value
             for name, value in terms.items()
-            if not chi_only or name not in ("local", "extension")
+            if getattr(weights, name)
+            and (
+                not chi_only
+                or name not in ("local", "local_gradient", "local_tkd", "extension")
+            )
         )
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError("Nonfinite training loss")
@@ -583,7 +645,14 @@ def validate(
             batch, **(synthesis_options or dict(background_mode="mixture"))
         )
         output, raw, predicted_field = _predict_training_batch(
-            model, data, device, bf16, filter_only, bool(weights.extension)
+            model,
+            data,
+            device,
+            bf16,
+            filter_only,
+            bool(weights.extension),
+            include_gradient=bool(weights.local_gradient),
+            include_tkd=bool(weights.local_tkd),
         )
         per_sample = {
             name: values.flatten()
@@ -597,7 +666,9 @@ def validate(
             ).items()
         }
         per_sample["loss"] = sum(
-            getattr(weights, name) * values for name, values in per_sample.items()
+            getattr(weights, name) * values
+            for name, values in per_sample.items()
+            if getattr(weights, name)
         )
         per_sample.update(
             {"raw_" + name: value.flatten() for name, value in raw.items()}

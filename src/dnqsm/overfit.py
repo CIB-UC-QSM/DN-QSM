@@ -50,6 +50,10 @@ class OverfitConfig:
     laplacian_fp32: bool = True
     conditional_laplacian_threshold: float = 32.0
     filter_output_skip: bool = True
+    filter_laplacian_residual: bool = False
+    filter_refinement_features: int = 0
+    activation: str = "leaky_relu"
+    leaky_relu_slope: float = 0.01
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -62,9 +66,11 @@ class OverfitConfig:
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
     lambda_local: float = 1.5
+    lambda_local_gradient: float = 1.0
     lambda_chi: float = 1.0
     lambda_physics: float = 1.0
     lambda_extension: float = 0.0
+    lambda_local_tkd: float = 0.0
     physics_warmup_steps: int = 0
     gradient_every: int = 50
     comet: bool = False
@@ -113,12 +119,18 @@ class OverfitConfig:
             laplacian_fp32=self.laplacian_fp32,
             conditional_laplacian_threshold=self.conditional_laplacian_threshold,
             filter_output_skip=self.filter_output_skip,
+            filter_laplacian_residual=self.filter_laplacian_residual,
+            filter_refinement_features=self.filter_refinement_features,
+            activation=self.activation,
+            leaky_relu_slope=self.leaky_relu_slope,
         )
         LossWeights(
             local=self.lambda_local,
+            local_gradient=self.lambda_local_gradient,
             chi=self.lambda_chi,
             physics=self.lambda_physics,
             extension=self.lambda_extension,
+            local_tkd=self.lambda_local_tkd,
         )
         LossNormalization(self.chi_loss_floor, self.field_loss_floor)
         if min(self.physics_warmup_steps, self.gradient_every) < 0:
@@ -185,6 +197,13 @@ def _run_overfit(
             != config.conditional_laplacian_threshold
             or resumed["model_config"].get("filter_output_skip", False)
             != config.filter_output_skip
+            or resumed["model_config"].get("filter_laplacian_residual", False)
+            != config.filter_laplacian_residual
+            or resumed["model_config"].get("filter_refinement_features", 0)
+            != config.filter_refinement_features
+            or resumed["model_config"].get("activation", "celu") != config.activation
+            or resumed["model_config"].get("leaky_relu_slope", 0.01)
+            != config.leaky_relu_slope
         ):
             raise ValueError(
                 "Resume must preserve model capacity, filter input/precision, and TKD threshold"
@@ -202,9 +221,11 @@ def _run_overfit(
             "chi_loss_floor",
             "field_loss_floor",
             "lambda_local",
+            "lambda_local_gradient",
             "lambda_chi",
             "lambda_physics",
             "lambda_extension",
+            "lambda_local_tkd",
             "physics_warmup_steps",
         ):
             if getattr(config, name) != resumed["config"].get(name):
@@ -266,6 +287,10 @@ def _run_overfit(
             laplacian_fp32=config.laplacian_fp32,
             conditional_laplacian_threshold=config.conditional_laplacian_threshold,
             filter_output_skip=config.filter_output_skip,
+            filter_laplacian_residual=config.filter_laplacian_residual,
+            filter_refinement_features=config.filter_refinement_features,
+            activation=config.activation,
+            leaky_relu_slope=config.leaky_relu_slope,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -337,9 +362,11 @@ def _run_overfit(
             )
     weights = LossWeights(
         local=config.lambda_local,
+        local_gradient=config.lambda_local_gradient,
         chi=config.lambda_chi,
         physics=config.lambda_physics,
         extension=config.lambda_extension,
+        local_tkd=config.lambda_local_tkd,
     )
     normalization = (
         LossNormalization(config.chi_loss_floor, config.field_loss_floor)
@@ -618,6 +645,17 @@ def main(argv: list[str] | None = None) -> None:
         )
         values["filter_output_skip"] = checkpoint["config"].get(
             "filter_output_skip", False
+        )
+        values["filter_laplacian_residual"] = checkpoint["config"].get(
+            "filter_laplacian_residual", False
+        )
+        values["filter_refinement_features"] = checkpoint["config"].get(
+            "filter_refinement_features", 0
+        )
+        values["activation"] = checkpoint["config"].get("activation", "celu")
+        values["leaky_relu_slope"] = checkpoint["config"].get("leaky_relu_slope", 0.01)
+        values["lambda_local_gradient"] = checkpoint["config"].get(
+            "lambda_local_gradient", 0.0
         )
         del checkpoint
     values.update(overrides)

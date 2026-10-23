@@ -68,18 +68,27 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             self.assertEqual(getattr(weights, name), 1.0)
             self.assertEqual(weights.local, 1.5 * getattr(weights, name))
         root = Path(__file__).resolve().parents[1]
-        configs = [TrainConfig(), OverfitConfig()]
+        # Profiles that deliberately depart from the shared objective defaults.
+        # Every other shipped config must still match them exactly.
+        opt_in = {"fullgrid_100epochs.json": dict(extension=1.0, local_tkd=1.0)}
+        configs = [(None, TrainConfig()), (None, OverfitConfig())]
         configs.extend(
-            parse_args(["--config", str(root / "configs" / name)])
-            for name in ("corrective_200epochs.json", "corrective_ablation.json")
+            (path.name, parse_args(["--config", str(path)]))
+            for path in sorted((root / "configs").glob("*.json"))
         )
-        for config in configs:
+        for name_, config in configs:
             self.assertFalse(hasattr(config, "lambda_forward"))
+            declared = opt_in.get(name_, {})
             for name, weight in vars(weights).items():
                 self.assertEqual(
                     getattr(config, "lambda_" + name),
-                    0.0 if name == "extension" else weight,
+                    declared.get(name, 0.0 if name == "extension" else weight),
+                    msg=f"{name_ or type(config).__name__}: lambda_{name}",
                 )
+            # Exterior supervision is meaningless without an exterior to
+            # supervise; TrainConfig.validate enforces the pairing.
+            if declared.get("extension"):
+                self.assertTrue(config.full_grid_field)
             self.assertEqual(getattr(config, "physics_warmup_epochs", 0), 0)
             self.assertEqual(getattr(config, "physics_warmup_steps", 0), 0)
         prediction, chi, local, full, mask, dipole = self.example()
@@ -179,6 +188,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
                 (2, 4),
                 full_grid_field=True,
                 filter_input_version=1,
+                filter_laplacian_residual=False,
                 conditional_laplacian_threshold=0,
             )
         )
@@ -308,16 +318,22 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     def test_warmup_and_old_objective_resume_guard(self):
-        config = TrainConfig()
+        config = TrainConfig(lambda_physics=1.0)
         self.assertEqual(
             training_weights(config, 0, 10).physics, config.lambda_physics / 10
         )
         self.assertEqual(training_weights(config, 9, 10).physics, config.lambda_physics)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "old.pt"
-            torch.save(dict(version=1, loss_version=2), checkpoint)
-            with self.assertRaisesRegex(ValueError, "older loss"):
-                run_training(replace(config, device="cpu", resume=str(checkpoint)))
+            # Version 5 predates TKD supervision, so its optimizer and
+            # scheduler cannot silently continue under the current objective.
+            for version in (2, 5):
+                torch.save(dict(version=1, loss_version=version), checkpoint)
+                with self.subTest(loss_version=version):
+                    with self.assertRaisesRegex(ValueError, "older loss"):
+                        run_training(
+                            replace(config, device="cpu", resume=str(checkpoint))
+                        )
             profile = Path(temporary) / "profile.json"
             profile.write_text(
                 json.dumps(dict(epochs=3, features=[2, 4], normalize_loss=True))
@@ -372,6 +388,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
                 val_views=1,
                 accumulation_steps=1,
                 gradient_every=1,
+                lambda_physics=1.0,
                 physics_warmup_epochs=3,
                 log_every=999,
                 comet=True,

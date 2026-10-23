@@ -56,7 +56,10 @@ class ConditionalScalingTests(unittest.TestCase):
         torch.testing.assert_close(captured[0], expected, rtol=0, atol=0)
         scale = torch.where(selected, interior_scale, total_scale)
         torch.testing.assert_close(
-            output, network_outputs[0].float() * scale * mask, rtol=0, atol=0
+            output,
+            network_outputs[0].float() * scale * mask,
+            rtol=0,
+            atol=0,
         )
         output.square().mean().backward()
         self.assertTrue(bool(torch.isfinite(field.grad).all()))

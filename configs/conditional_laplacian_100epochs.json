@@ -1,4 +1,5 @@
 {
+  "activation": "leaky_relu",
   "epochs": 100,
   "features": [
     23,
@@ -13,6 +14,7 @@
   "normalize_loss": true,
   "mse_input_ratio_cap": 10.0,
   "lambda_local": 1.5,
+  "lambda_local_gradient": 1.0,
   "lambda_physics": 1.0,
   "lambda_chi": 1.0,
   "lambda_extension": 0.0,

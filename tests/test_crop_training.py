@@ -190,6 +190,7 @@ class CropTrainingTests(unittest.TestCase):
                     (2, 4),
                     residual_filter=True,
                     filter_input_version=1,
+                    filter_laplacian_residual=False,
                     conditional_laplacian_threshold=0,
                 )
             )

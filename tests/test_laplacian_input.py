@@ -156,6 +156,7 @@ class LaplacianInputTests(unittest.TestCase):
                         "--filter-input-version",
                         "1",
                         "--no-laplacian-input",
+                        "--no-filter-laplacian-residual",
                         "--conditional-laplacian-threshold",
                         "0",
                     ]
@@ -169,6 +170,7 @@ class LaplacianInputTests(unittest.TestCase):
             old_config.pop("filter_input_version")
             old_config.pop("filter_pretrain_epochs")
             old_config.pop("conditional_laplacian_threshold")
+            old_config.pop("filter_laplacian_residual")
             torch.save(dict(config=old_config), path)
             resumed = parse_args(["--resume", str(path)])
             self.assertFalse(model_config(resumed).laplacian_input)
@@ -191,9 +193,8 @@ class LaplacianInputTests(unittest.TestCase):
             model.filter.final.bias.fill_(1)
         output = model(phase, mask, dipole)
         self.assertEqual(float(output.local_field[mask == 0].abs().sum()), 0)
-        torch.testing.assert_close(
-            output.local_field, masked_rms(phase * mask, mask) * mask
-        )
+        scale = masked_rms(phase * mask, mask)
+        torch.testing.assert_close(output.local_field, scale * mask)
         inverse, _ = cutoff_kernels(dipole, model.config.threshold)
         torch.testing.assert_close(
             output.tkd, apply_multiplier(output.local_field, inverse)
@@ -208,10 +209,54 @@ class LaplacianInputTests(unittest.TestCase):
             model.filter.final.bias.zero_()
         self.assertEqual(float(model.predict_local_field(phase, mask).abs().sum()), 0)
 
+    def test_full_grid_field_feeds_tkd_an_unmasked_field_from_two_channels(self):
+        # Zeroing the field outside the ROI is what costs the masked pipeline
+        # its irreducible susceptibility error, because TKD then applies a
+        # full-grid operator to a field the mask has already truncated.
+        config = ModelConfig(
+            (2, 4),
+            full_grid_field=True,
+            filter_input_version=1,
+            conditional_laplacian_threshold=0.0,
+        )
+        model = DNQSM(config).eval()
+        self.assertEqual(model.filter.downs[0][0].in_channels, 2)
+        phase = torch.randn(1, 1, 9, 11, 13) * 0.01
+        mask = torch.zeros_like(phase)
+        mask[..., 2:-2, 2:-2, 2:-2] = 1
+        dipole = dipole_tensor(phase.shape[-3:])
+        with torch.no_grad():
+            model.filter.final.weight.zero_()
+            model.filter.final.bias.fill_(1)
+        output = model(phase, mask, dipole)
+        scale = masked_rms(phase * mask, mask)
+        torch.testing.assert_close(output.local_field, scale * torch.ones_like(phase))
+        self.assertGreater(float(output.local_field[mask == 0].detach().abs().sum()), 0)
+        inverse, _ = cutoff_kernels(dipole, config.threshold)
+        torch.testing.assert_close(
+            output.tkd, apply_multiplier(output.local_field, inverse)
+        )
+
+    def test_laplacian_only_input_also_supports_an_unmasked_output(self):
+        # Input preprocessing and output masking are separable: the filter
+        # still sees the Laplacian of the masked field either way.
+        config = ModelConfig((2, 4), full_grid_field=True)
+        self.assertEqual(config.filter_input_version, 2)
+        self.assertEqual(config.conditional_laplacian_threshold, 32.0)
+        model = DNQSM(config).eval()
+        self.assertEqual(model.filter.downs[0][0].in_channels, 1)
+        phase = torch.randn(1, 1, 9, 11, 13) * 0.01
+        mask = torch.zeros_like(phase)
+        mask[..., 2:-2, 2:-2, 2:-2] = 1
+        with torch.no_grad():
+            model.filter.final.weight.zero_()
+            model.filter.final.bias.fill_(1)
+            local = model.predict_local_field(phase, mask)
+        self.assertGreater(float(local[mask == 0].abs().sum()), 0)
+
     def test_new_architecture_rejects_incompatible_options(self):
         for options in (
             dict(residual_filter=True),
-            dict(full_grid_field=True),
             dict(laplacian_input=False),
             dict(filter_input_version=3),
         ):
