@@ -216,6 +216,14 @@ def load_sim2_case(data_dir: str | Path | None = None, pad: int = 20) -> Evaluat
         ),
     )
     case.validate()
+    # The supplied phase is not the dipole forward field of the supplied
+    # reference susceptibility. Record the mismatch beside every sim2 score so
+    # the benchmark's own inconsistency travels with the number it bounds.
+    case.metadata["forward_consistency_nrmse"] = masked_nrmse(
+        case.phase,
+        apply_dipole(case.chi * case.mask, case.dipole) * case.mask,
+        case.mask,
+    )[0]
     return case
 
 
