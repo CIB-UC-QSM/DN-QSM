@@ -111,7 +111,12 @@ class BalancedTrainingTests(unittest.TestCase):
         )
         singles = []
         for i in range(2):
-            single = Reconstruction(*(v[i : i + 1] for v in vars(output).values()))
+            single = Reconstruction(
+                *(
+                    v[i : i + 1] if v is not None else None
+                    for v in vars(output).values()
+                )
+            )
             singles.append(
                 reconstruction_loss(
                     single,

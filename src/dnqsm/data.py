@@ -1,7 +1,7 @@
 """Source caching and synthesis adapted from wh_net's maintained dataloader.
 
 All source data are read-only. Synthesis returns the clean local field explicitly;
-noise and background never enter that target. No local impulse augmentation.
+noise and background never enter that target. Focal lesions are optional.
 """
 
 import json
@@ -15,7 +15,18 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, Sampler, default_collate
 
 from .chi_augmentation import PROFILES, ChiAugmentationConfig, augment_chi
-from .physics import SPATIAL, continuous_dipole_kernel
+from .lesion_augmentation import (
+    LesionAugmentationConfig,
+    apply_lesion_dephasing,
+    augment_lesions,
+)
+from .physics import (
+    SPATIAL,
+    apply_dipole,
+    continuous_dipole_kernel,
+    dipole_tensor,
+    isotropic_dipole_tensors,
+)
 
 TRAINING_CONDITIONS = {
     "snr_min": 40.0,
@@ -26,6 +37,29 @@ TRAINING_CONDITIONS = {
     "reliability_min": 0.1,
 }
 CROP_RESIZE_SHAPE = (160, 160, 160)
+VOXEL_SIZE_SEED = 982451653
+
+
+def validate_voxel_size_range(low: float, high: float) -> None:
+    if not all(math.isfinite(v) for v in (low, high)) or not 0 < low <= high:
+        raise ValueError("Voxel-size bounds must be finite, positive, and ordered")
+
+
+def sample_voxel_sizes(seeds, low: float, high: float, device="cpu"):
+    """Independent per-view CPU RNG; repeat one isotropic draw on all axes."""
+    validate_voxel_size_range(low, high)
+    values = []
+    for seed in seeds:
+        generator = torch.Generator().manual_seed(int(seed) + VOXEL_SIZE_SEED)
+        value = (
+            low
+            if low == high
+            else low
+            + (high - low)
+            * float(torch.rand((), generator=generator, dtype=torch.float64))
+        )
+        values.append((value,) * 3)
+    return torch.tensor(values, dtype=torch.float64, device=device)
 
 
 def separable_dilation(mask):
@@ -40,7 +74,7 @@ def separable_dilation(mask):
     return x.squeeze(0).bool()
 
 
-def training_records(data_dir, source_manifest=None):
+def training_records(data_dir, source_manifest=None, *, original_samples_only=False):
     """Return explicit source identities; never silently split augmented files."""
     root = Path(data_dir)
     manifest_path = Path(source_manifest) if source_manifest else root / "subjects.json"
@@ -71,6 +105,17 @@ def training_records(data_dir, source_manifest=None):
         records.append({"image": str(image), "mask": str(mask), "subject": subject})
     if not records:
         raise ValueError(f"No training volumes in {root}")
+    if original_samples_only:
+        records = [
+            r
+            for r in records
+            if 0 <= int(Path(r["image"]).stem.split("_")[-1]) < 105
+            and r["subject"] == f"qsm:{int(Path(r['image']).stem.split('_')[-1]):04d}"
+        ]
+        if len(records) != 105:
+            raise ValueError(
+                "Original-only training requires all 105 original QSM samples"
+            )
     return records
 
 
@@ -97,6 +142,7 @@ class TrainingVolumes(Dataset):
         crop_probability=0.0,
         crop_resize=True,
         chi_augmentation=None,
+        lesion_augmentation=None,
         shape_stress=False,
     ):
         self.records = records
@@ -121,6 +167,10 @@ class TrainingVolumes(Dataset):
             policy if not validation or shape_stress else ChiAugmentationConfig()
         )
         self.shape_stress = shape_stress
+        lesion_policy = LesionAugmentationConfig.from_dict(lesion_augmentation)
+        self.lesion_augmentation = (
+            LesionAugmentationConfig() if validation else lesion_policy
+        )
         if self.chi_augmentation.enabled and chi_scale_mode != "rms_mixture":
             raise ValueError("Chi augmentation requires rms_mixture scaling")
         import multiprocessing
@@ -274,6 +324,18 @@ class TrainingVolumes(Dataset):
             if self.chi_augmentation.final_grid_rms
             else before_rms
         )
+        tissue_rms = float(final_rms)
+        result["chi"], lesions = augment_lesions(
+            result["chi"],
+            result["mask"],
+            self.lesion_augmentation,
+            sample_seed,
+            record["subject"],
+        )
+        if lesions["count"]:
+            final_rms = (
+                (result["chi"].square() * result["mask"]).sum() / result["mask"].sum()
+            ).sqrt()
         result.update(
             chi_profile=chi_metadata["profile"],
             chi_requested_profile=chi_metadata["requested_profile"],
@@ -282,6 +344,22 @@ class TrainingVolumes(Dataset):
             chi_rms_target=target_rms,
             chi_rms_final=float(final_rms),
             chi_rms_before_final_scale=float(before_rms),
+            chi_rms_before_lesions=tissue_rms,
+            lesion_count=lesions["count"],
+            lesion_spheres=lesions["spheres"],
+            lesion_ellipsoids=lesions["ellipsoids"],
+            lesion_skipped=lesions["skipped"],
+            lesion_parameters=json.dumps(lesions["parameters"], sort_keys=True),
+            dephasing_parameters=json.dumps(
+                lesions["dephasing_events"], sort_keys=True
+            ),
+            lesion_dephasing_count=len(lesions["dephasing_events"]),
+            lesion_dephasing_signal_loss=sum(
+                event["kind"] == "signal_loss" for event in lesions["dephasing_events"]
+            ),
+            lesion_dephasing_spikes=sum(
+                event["kind"] == "phase_spike" for event in lesions["dephasing_events"]
+            ),
         )
         result.update(
             original_shape=torch.tensor(original_shape),
@@ -313,14 +391,132 @@ class ShapeFieldSynthesizer:
         self.device, self.capacity = device, capacity
         self.cache = OrderedDict()
 
-    def __call__(self, batch, **kwargs):
-        shape = tuple(batch["chi"].shape[-3:])
+    def _for_shape(self, shape):
         if shape not in self.cache:
             if len(self.cache) == self.capacity:
                 self.cache.popitem(last=False)
             self.cache[shape] = FieldSynthesizer(shape, self.device)
         self.cache.move_to_end(shape)
-        return self.cache[shape](batch, **kwargs)
+        return self.cache[shape]
+
+    def __call__(
+        self, batch, *, patch_size=0, voxel_size_min=1.0, voxel_size_max=1.0, **kwargs
+    ):
+        shape = tuple(batch["chi"].shape[-3:])
+        data = self._for_shape(shape)(
+            batch,
+            voxel_size_min=voxel_size_min,
+            voxel_size_max=voxel_size_max,
+            **kwargs,
+        )
+        if not patch_size:
+            return data
+        patch_dipole = (
+            self._for_shape((patch_size,) * 3).dipole
+            if voxel_size_min == voxel_size_max == 1.0
+            else isotropic_dipole_tensors((patch_size,) * 3, data["voxel_size"])
+        )
+        return extract_simulated_patches(data, batch["seed"], patch_size, patch_dipole)
+
+
+def _crop_batch(volume, starts, size):
+    return torch.cat(
+        [
+            volume[i : i + 1, :, d : d + size, h : h + size, w : w + size]
+            for i, (d, h, w) in enumerate(starts)
+        ]
+    )
+
+
+@torch.no_grad()
+def extract_simulated_patches(data, seeds, size, dipole):
+    """Crop aligned fields only after full-grid simulation, without rescaling.
+
+    An independent per-view RNG selects a foreground voxel and a random crop
+    containing it. No source susceptibility is cropped before field synthesis.
+    """
+    shape = tuple(data["chi"].shape[-3:])
+    if type(size) is not int or size < 2 or min(shape) < size:
+        raise ValueError(f"Patch size {size} does not fit simulation grid {shape}")
+    starts = []
+    for mask, seed in zip(data["mask"], seeds.tolist(), strict=True):
+        generator = torch.Generator(device=mask.device).manual_seed(seed + 32452843)
+        occupied = mask[0].nonzero()
+        if not len(occupied):
+            raise ValueError("Cannot sample a patch from an empty mask")
+        anchor = occupied[
+            torch.randint(len(occupied), (), generator=generator, device=mask.device)
+        ].tolist()
+        start = tuple(
+            int(
+                torch.randint(
+                    max(0, center - size + 1),
+                    min(center, length - size) + 1,
+                    (),
+                    generator=generator,
+                    device=mask.device,
+                )
+            )
+            for center, length in zip(anchor, shape, strict=True)
+        )
+        starts.append(start)
+    result = {
+        key: _crop_batch(data[key], starts, size)
+        for key in (
+            "phase",
+            "mask",
+            "chi",
+            "local",
+            "local_full",
+            "background",
+            "noise",
+        )
+    }
+    result.update(
+        dipole=dipole,
+        source_dipole=data["dipole"],
+        source_shape=shape,
+        patch_start=starts,
+    )
+    if "voxel_size" in data:
+        result["voxel_size"] = data["voxel_size"]
+    if "dephasing" in data:
+        result["dephasing"] = _crop_batch(data["dephasing"], starts, size)
+    return result
+
+
+def simulated_forward_field(chi, data):
+    """Forward prediction with the original simulation grid retained for loss.
+
+    For patches, insert the predicted susceptibility error into the original
+    grid. Ground truth outside the patch is fixed context used only by this
+    training loss, never as a model input. This avoids treating a crop of a
+    full-grid local field as the periodic field of an isolated susceptibility
+    patch. Perfect susceptibility has zero physics error.
+    """
+    if "patch_start" not in data:
+        return apply_dipole(chi, data["dipole"])
+    size = chi.shape[-1]
+    error = chi.float() - data["chi"].detach().float()
+    full_error = torch.cat(
+        [
+            F.pad(
+                error[i : i + 1],
+                tuple(
+                    value
+                    for start, length in reversed(
+                        list(zip(starts, data["source_shape"], strict=True))
+                    )
+                    for value in (start, length - start - size)
+                ),
+            )
+            for i, starts in enumerate(data["patch_start"])
+        ]
+    )
+    field_error = apply_dipole(full_error, data["source_dipole"])
+    return data["local_full"].detach() + _crop_batch(
+        field_error, data["patch_start"], size
+    )
 
 
 class FieldSynthesizer(torch.nn.Module):
@@ -342,6 +538,7 @@ class FieldSynthesizer(torch.nn.Module):
         self,
         batch,
         *,
+        patch_size: int = 0,
         background_mode: str = "legacy",
         curriculum_progress: float = 1.0,
         strong_min_ratio: float = 0.001,
@@ -350,7 +547,10 @@ class FieldSynthesizer(torch.nn.Module):
         weak_probability: float = 0.1,
         snr_min: float = TRAINING_CONDITIONS["snr_min"],
         snr_max: float = TRAINING_CONDITIONS["snr_max"],
+        voxel_size_min: float = 1.0,
+        voxel_size_max: float = 1.0,
     ):
+        validate_voxel_size_range(voxel_size_min, voxel_size_max)
         if background_mode not in ("legacy", "ratio", "mixture"):
             raise ValueError(f"Unknown background mode: {background_mode}")
         if not all(math.isfinite(v) for v in (snr_min, snr_max)) or not (
@@ -375,6 +575,15 @@ class FieldSynthesizer(torch.nn.Module):
         mask = batch["mask"].to(device, non_blocking=True).float()
         dilated = batch["dilated"].to(device, non_blocking=True)
         chi = chi * mask
+        voxel_sizes = sample_voxel_sizes(
+            batch["seed"].tolist(), voxel_size_min, voxel_size_max, device
+        )
+        # Preserve the historical unit-spacing operator exactly when disabled.
+        dipole = (
+            self.dipole
+            if voxel_size_min == voxel_size_max == 1.0
+            else isotropic_dipole_tensors(self.shape, voxel_sizes)
+        )
         source_fields, noises, snrs, ratios = [], [], [], []
         for index, seed in enumerate(batch["seed"].tolist()):
             # Independent per-sample streams make validation invariant to batch size.
@@ -443,12 +652,10 @@ class FieldSynthesizer(torch.nn.Module):
         def inverse(x):
             return torch.fft.irfftn(x, s=self.shape, dim=SPATIAL)
 
-        local_full = inverse(self.dipole * torch.fft.rfftn(chi, dim=SPATIAL))
+        local_full = inverse(dipole * torch.fft.rfftn(chi, dim=SPATIAL))
         local = local_full * mask
         background = (
-            inverse(
-                self.dipole * torch.fft.rfftn(torch.stack(source_fields), dim=SPATIAL)
-            )
+            inverse(dipole * torch.fft.rfftn(torch.stack(source_fields), dim=SPATIAL))
             * mask
         )
         count = mask.sum(dim=SPATIAL, keepdim=True).clamp_min(1)
@@ -472,16 +679,32 @@ class FieldSynthesizer(torch.nn.Module):
             / (rms(noise) * torch.stack(snrs).reshape(-1, 1, 1, 1, 1))
         )
         phase = (local + background + noise) * mask
-        return dict(
+        phase, dephasing = apply_lesion_dephasing(
+            phase, chi, mask, batch.get("dephasing_parameters")
+        )
+        data = dict(
             phase=phase,
             mask=mask,
-            dipole=self.dipole,
+            dipole=dipole,
+            voxel_size=voxel_sizes,
             chi=chi,
             background=background,
             local=local,
             local_full=local_full,
             noise=noise,
         )
+        if dephasing is not None:
+            data["dephasing"] = dephasing
+        if patch_size:
+            return extract_simulated_patches(
+                data,
+                batch["seed"],
+                patch_size,
+                dipole_tensor((patch_size,) * 3, device)
+                if voxel_size_min == voxel_size_max == 1.0
+                else isotropic_dipole_tensors((patch_size,) * 3, voxel_sizes),
+            )
+        return data
 
 
 def make_subject_split(records, fraction, seed):

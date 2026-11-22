@@ -40,5 +40,6 @@
   "seed": 0,
   "laplacian_input": true,
   "filter_input_version": 2,
+  "conditional_laplacian_threshold": 32.0,
   "filter_pretrain_epochs": 10
 }

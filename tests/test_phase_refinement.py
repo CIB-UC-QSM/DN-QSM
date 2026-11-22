@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from dnqsm.model import DNQSM, ModelConfig, PhaseRefinementBlock
+from dnqsm.model import DNQSM, PhaseRefinementBlock
 from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
@@ -17,6 +17,7 @@ from dnqsm.training import (
     parse_args,
     set_training_branch,
 )
+from tests.helpers import laplacian_model_config
 
 
 class PhaseRefinementTests(unittest.TestCase):
@@ -40,7 +41,7 @@ class PhaseRefinementTests(unittest.TestCase):
         torch.testing.assert_close(block(x), x, rtol=0, atol=0)
         self.assertEqual(block.conv1.out_channels, 32)
         self.assertEqual(block.conv2.in_channels, 32)
-        self.assertEqual(sum(p.numel() for p in block.parameters()), 1825)
+        self.assertEqual(sum(p.numel() for p in block.parameters()), 1760)
         optimizer = torch.optim.SGD(block.parameters(), lr=0.01)
         block(x).square().mean().backward()
         self.assertGreater(float(block.conv2.weight.grad.abs().sum()), 0)
@@ -55,7 +56,7 @@ class PhaseRefinementTests(unittest.TestCase):
 
     def test_refines_laplacian_sum_before_rescaling_with_checkpointing_and_bf16(self):
         model = DNQSM(
-            ModelConfig(
+            laplacian_model_config(
                 (2, 4),
                 checkpoint_blocks=True,
                 filter_output_skip=False,
@@ -124,8 +125,10 @@ class PhaseRefinementTests(unittest.TestCase):
         )
 
     def test_warm_start_adds_identity_and_preserves_both_networks(self):
-        old = DNQSM(ModelConfig((2, 4), filter_refinement_features=0)).eval()
-        new = DNQSM(ModelConfig((2, 4), filter_refinement_features=32)).eval()
+        old = DNQSM(laplacian_model_config((2, 4), filter_refinement_features=0)).eval()
+        new = DNQSM(
+            laplacian_model_config((2, 4), filter_refinement_features=32)
+        ).eval()
         new.initialize_from(old)
         for name, value in old.state_dict().items():
             torch.testing.assert_close(new.state_dict()[name], value, rtol=0, atol=0)
@@ -139,7 +142,7 @@ class PhaseRefinementTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "refinement block"):
             old.initialize_from(new)
-        resized = DNQSM(ModelConfig((2, 4), filter_refinement_features=16))
+        resized = DNQSM(laplacian_model_config((2, 4), filter_refinement_features=16))
         with self.assertRaisesRegex(ValueError, "refinement block"):
             resized.initialize_from(new)
 
@@ -159,7 +162,7 @@ class PhaseRefinementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             for width in (0, 7):
                 model = DNQSM(
-                    ModelConfig((2, 4), filter_refinement_features=width)
+                    laplacian_model_config((2, 4), filter_refinement_features=width)
                 ).eval()
                 config = asdict(model.config)
                 if not width:
@@ -179,7 +182,7 @@ class PhaseRefinementTests(unittest.TestCase):
                     )
         for width in (-1, 1.5, True):
             with self.assertRaisesRegex(ValueError, "nonnegative integer"):
-                ModelConfig(filter_refinement_features=width)
+                laplacian_model_config(filter_refinement_features=width)
 
 
 if __name__ == "__main__":

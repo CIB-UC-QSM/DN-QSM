@@ -31,6 +31,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         mask = torch.ones_like(phase)
         output = model(phase, mask, dipole_tensor(phase.shape[-3:]))
         self.assertEqual(output.chi.shape, phase.shape)
+        self.assertIsNone(output.harmonic_field)
         output.chi.square().mean().backward()
         self.assertTrue(
             all(
@@ -72,7 +73,8 @@ class PhysicsAndModelTests(unittest.TestCase):
             )
             with torch.no_grad():
                 model.filter.final.weight.zero_()
-                model.filter.final.bias.zero_()
+                if model.filter.final.bias is not None:
+                    model.filter.final.bias.zero_()
             result = model(phase, mask, dipole_tensor(phase.shape[-3:]))
             torch.testing.assert_close(
                 result.local_field,
@@ -98,7 +100,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         torch.testing.assert_close(
             apply_multiplier(projected, projection), projected, atol=4e-7, rtol=2e-5
         )
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(ModelConfig((2, 4), cutoff_mode="hard"))
         mask = torch.ones_like(volume)
         mask[..., :3, :, :] = 0
         result = model(volume * 0.01, mask, dipole)
@@ -187,15 +189,18 @@ class PhysicsAndModelTests(unittest.TestCase):
     def test_checkpointed_gradients_match_and_both_networks_train(self):
         model = DNQSM(ModelConfig((2, 4), checkpoint_blocks=False))
         checkpointed = copy.deepcopy(model)
-        for network in (checkpointed.filter, checkpointed.null_network):
-            network.checkpoint_blocks = True
+        for network in checkpointed.modules():
+            if hasattr(network, "checkpoint_blocks"):
+                network.checkpoint_blocks = True
         phase = torch.randn(1, 1, 9, 11, 13) * 0.02
         mask = torch.ones_like(phase)
         dipole = dipole_tensor(phase.shape[-3:])
         gradients = []
         for net in (model, checkpointed):
             result = net(phase, mask, dipole)
-            loss, _ = reconstruction_loss(result, phase * 0.5, phase, mask, dipole)
+            loss, _ = reconstruction_loss(
+                result, phase * 0.5, phase, mask, dipole, input_field=phase
+            )
             loss.backward()
             for branch in (net.filter, net.null_network):
                 self.assertGreater(
@@ -210,7 +215,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         mask = torch.ones_like(phase)
         d = dipole_tensor(phase.shape[-3:])
         output = model(phase, mask, d)
-        loss, _ = reconstruction_loss(output, phase, phase, mask, d)
+        loss, _ = reconstruction_loss(output, phase, phase, mask, d, input_field=phase)
         loss.backward()
         self.assertTrue(
             all(

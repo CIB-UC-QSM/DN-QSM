@@ -1,10 +1,13 @@
 {
   "activation": "leaky_relu",
+  "data_dir": "/home/mathias/Documents/PhD/wh_net/data/training/joint",
   "source_manifest": null,
+  "cache_dir": "/home/mathias/Documents/PhD/DN-QSM/artifacts/cache/training",
   "run_dir": "",
   "resume": null,
   "init_checkpoint": "artifacts/runs/dnqsm_laplacian_fp32_finetune100_20261020_001036/model_last.pt",
   "device": "cuda:0",
+  "cuda_memory_gb": 90.21236877441406,
   "cuda_allocator_config": "expandable_segments:True",
   "epochs": 100,
   "training_schedule": "joint",
@@ -153,6 +156,7 @@
   "gradient_every": 100,
   "bf16": true,
   "comet": true,
+  "comet_env_file": "/home/mathias/Documents/PhD/wh_net/.env",
   "comet_project": "dn-qsm",
   "save_every_steps": 50,
   "log_every": 1,
@@ -161,5 +165,7 @@
   "max_val_subjects": 0,
   "evaluate_external": true,
   "external_eval_every": 1,
+  "evaluation_data_dir": "/home/mathias/Documents/PhD/wh_net/data/evaluation",
+  "cosmos_simulation": "/home/mathias/Documents/PhD/wh_net/artifacts/runs/wh_tv_cosmos_20260914_000637_662208/simulation.pt",
   "sim2_pad": 20
 }

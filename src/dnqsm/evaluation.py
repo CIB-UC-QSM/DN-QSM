@@ -3,7 +3,7 @@
 import argparse
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import nibabel as nib
@@ -13,7 +13,8 @@ from scipy.io import loadmat
 from torch import Tensor
 
 from .logging import _pyplot, comparison_figure, nrmse_label, write_json
-from .paths import EVALUATION_DATA_DIR, REFERENCE_ROOT
+from .losses import harmonic_laplacian_loss
+from .paths import DEFAULT_MODEL_CHECKPOINT, EVALUATION_DATA_DIR, REFERENCE_ROOT
 from .physics import (
     apply_dipole,
     continuous_dipole_kernel,
@@ -169,6 +170,7 @@ def center_pad(volume: np.ndarray, pad: int) -> tuple[np.ndarray, tuple[int, int
 
 
 def load_sim2_case(data_dir: str | Path | None = None, pad: int = 20) -> EvaluationCase:
+    voxel_size = (0.65, 0.65, 0.65)
     root = Path(data_dir or EVALUATION_DATA_DIR)
     phase = np.asarray(loadmat(root / "Sim2.mat")["phase"], dtype=np.float32)
     mask = np.asarray(loadmat(root / "mask_final.mat")["mask_final"], dtype=np.float32)
@@ -195,7 +197,7 @@ def load_sim2_case(data_dir: str | Path | None = None, pad: int = 20) -> Evaluat
         "sim2",
         _tensor(padded_phase),
         _tensor(padded_mask),
-        _tensor(continuous_dipole_kernel(padded_phase.shape)),
+        _tensor(continuous_dipole_kernel(padded_phase.shape, voxel_size=voxel_size)),
         _tensor(padded_chi),
         original_shape=tuple(mask.shape),
         crop_start=tuple(int(v) for v in start),
@@ -206,6 +208,7 @@ def load_sim2_case(data_dir: str | Path | None = None, pad: int = 20) -> Evaluat
             phase=str((root / "Sim2.mat").resolve()),
             chi_reference=str((root / "volumes/Sim2ChiGT.nii.gz").resolve()),
             physical_units="ppm",
+            voxel_size_mm=list(voxel_size),
             factor=1.0,
             padding=pad,
             crop_start=start.tolist(),
@@ -255,6 +258,7 @@ def evaluate_checkpoint(
     epoch=0,
     bf16=True,
     name_prefix="external",
+    inference_options=None,
 ) -> dict:
     target = require_device(device)
     model = load_trained_model(checkpoint, target)
@@ -269,6 +273,7 @@ def evaluate_checkpoint(
         bf16=bf16,
         checkpoint=checkpoint,
         name_prefix=name_prefix,
+        inference_options=inference_options,
     )
 
 
@@ -286,9 +291,11 @@ def evaluate_model(
     checkpoint=None,
     export_volumes=True,
     name_prefix="external",
+    inference_options=None,
 ) -> dict:
     """Evaluate current weights and log case scalars/images at their epoch."""
     target = require_device(device)
+    inference_config = replace(model.inference_config, **(inference_options or {}))
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     was_training = model.training
@@ -307,6 +314,7 @@ def evaluate_model(
                 checkpoint=checkpoint,
                 export_volumes=export_volumes,
                 name_prefix=name_prefix,
+                inference_config=inference_config,
             )
             for case in cases
         }
@@ -329,6 +337,7 @@ def _evaluate_case(
     checkpoint,
     export_volumes,
     name_prefix,
+    inference_config,
 ):
     """Limit input, prediction, and FFT tensor lifetimes to a single case."""
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +349,7 @@ def _evaluate_case(
         torch.cuda.synchronize(target)
     started = time.perf_counter()
     with autocast_context(target, bf16):
-        output = model(phase, mask, dipole)
+        output = model.infer(phase, mask, dipole, **asdict(inference_config))
     if target.type == "cuda":
         torch.cuda.synchronize(target)
     seconds = time.perf_counter() - started
@@ -360,10 +369,24 @@ def _evaluate_case(
         ("Total field (ppm)", phase * mask, False),
         ("Filtered local field (ppm)", output.local_field * mask, False),
         ("Ground truth susceptibility (ppm)", chi * mask, True),
-        ("TKD, " + nrmse_label(output.tkd, chi, mask), output.tkd * mask, True),
+        (
+            ("Soft inverse, " if model.config.cutoff_mode == "soft" else "TKD, ")
+            + nrmse_label(output.tkd, chi, mask),
+            output.tkd * mask,
+            True,
+        ),
         ("DN-QSM, " + nrmse_label(output.chi, chi, mask), output.chi * mask, True),
         ("Susceptibility error (ppm)", (output.chi - chi) * mask, True),
     ]
+    if output.harmonic_field is not None:
+        harmonic = output.harmonic_field * mask
+        metrics["harmonic_laplacian_mse"] = float(
+            harmonic_laplacian_loss(harmonic, mask).mean()
+        )
+        metrics["field_decomposition_mae"] = float(
+            masked_mean((output.local_field + harmonic - phase).abs(), mask).mean()
+        )
+        rows.append(("Estimated harmonic field (ppm)", harmonic, False))
     if case.local is not None:
         local = case.local.to(target)
         metrics["local_nrmse"] = masked_nrmse(output.local_field, local, mask)[0]
@@ -409,10 +432,21 @@ def _evaluate_case(
             checkpoint=str(Path(checkpoint).resolve()) if checkpoint else None,
             training_epoch=epoch,
             threshold=model.config.threshold,
+            cutoff_mode=model.config.cutoff_mode,
             full_grid_field=model.config.full_grid_field,
             laplacian_input=model.config.laplacian_input,
+            laplacian_operator=model.config.laplacian_operator,
+            laplacian_extension_iters=model.config.laplacian_extension_iters,
+            laplacian_extension_mode=model.config.laplacian_extension_mode,
+            field_normalization=model.config.field_normalization,
+            normalization_layer=model.config.normalization_layer,
             filter_input_version=model.config.filter_input_version,
             grid_shape=list(phase.shape[-3:]),
+            inference=dict(
+                asdict(inference_config),
+                blending="gaussian" if inference_config.window_size else "full_volume",
+                fourier_grid="full_volume",
+            ),
             device=str(target),
             bf16=bool(
                 bf16 and target.type == "cuda" and torch.cuda.is_bf16_supported()
@@ -439,6 +473,8 @@ def _export_volumes(case, case_dir, phase, mask, chi, output):
         tkd=case.crop_volume(output.tkd * mask),
         local=case.crop_volume(output.local_field * mask),
     )
+    if output.harmonic_field is not None:
+        arrays["harmonic"] = case.crop_volume(output.harmonic_field * mask)
     np.savez_compressed(case_dir / "volumes.npz", **arrays)
     atomic = dict(
         chi=output.chi.cpu(),
@@ -447,13 +483,18 @@ def _export_volumes(case, case_dir, phase, mask, chi, output):
         local_field=output.local_field.cpu(),
         mask=mask.cpu(),
     )
+    if output.harmonic_field is not None:
+        atomic["harmonic_field"] = output.harmonic_field.cpu()
     torch.save(atomic, case_dir / "padded_predictions.pt")
-    for name, value in (
+    volumes = [
         ("chi", output.chi),
         ("tkd", output.tkd),
         ("local_field", output.local_field),
         ("mask", mask),
-    ):
+    ]
+    if output.harmonic_field is not None:
+        volumes.append(("harmonic_field", output.harmonic_field))
+    for name, value in volumes:
         nib.save(
             nib.Nifti1Image(case.restore_volume(value * mask), case.affine),
             case_dir / f"{name}.nii.gz",
@@ -485,7 +526,7 @@ def evaluate_training_epoch(model, cases, directory, device, logger, step, epoch
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_MODEL_CHECKPOINT)
     parser.add_argument(
         "--datasets", nargs="+", choices=("cosmos", "sim2"), default=("cosmos", "sim2")
     )
@@ -497,6 +538,24 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--cuda-memory-gb", type=float, default=0)
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--window-size",
+        type=int,
+        help="Override saved window size; 0 uses the full volume",
+    )
+    parser.add_argument(
+        "--window-overlap", type=float, help="Fractional overlap, default 0.5"
+    )
+    parser.add_argument(
+        "--gaussian-sigma-scale",
+        type=float,
+        help="Gaussian sigma / window size, default 0.125",
+    )
+    parser.add_argument(
+        "--window-batch-size",
+        type=int,
+        help="CNN windows evaluated together, default 1",
+    )
     args = parser.parse_args(argv)
     device = require_device(args.device)
     configure_memory_budget(device, args.cuda_memory_gb)
@@ -508,10 +567,25 @@ def main(argv: list[str] | None = None) -> None:
         sim2_pad=args.sim2_pad,
     )
     output = args.output_dir or args.checkpoint.parent / "evaluation"
+    inference_options = {
+        key: value
+        for key, value in dict(
+            window_size=args.window_size,
+            overlap=args.window_overlap,
+            sigma_scale=args.gaussian_sigma_scale,
+            window_batch_size=args.window_batch_size,
+        ).items()
+        if value is not None
+    }
     print(
         json.dumps(
             evaluate_checkpoint(
-                args.checkpoint, cases, output, args.device, bf16=args.bf16
+                args.checkpoint,
+                cases,
+                output,
+                args.device,
+                bf16=args.bf16,
+                inference_options=inference_options,
             ),
             indent=2,
             allow_nan=False,

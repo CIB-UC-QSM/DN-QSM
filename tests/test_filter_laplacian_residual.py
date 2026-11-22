@@ -8,11 +8,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from dnqsm.model import DNQSM, ModelConfig
+from dnqsm.model import DNQSM
 from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
 from dnqsm.training import checkpoint_training_config, model_config, parse_args
+from tests.helpers import laplacian_model_config
 
 
 class FilterLaplacianResidualTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class FilterLaplacianResidualTests(unittest.TestCase):
         torch.set_num_threads(2)
 
     def config(self, **overrides):
-        return ModelConfig(
+        return laplacian_model_config(
             (2, 4),
             filter_output_skip=False,
             filter_laplacian_residual=True,
@@ -120,11 +121,11 @@ class FilterLaplacianResidualTests(unittest.TestCase):
                     rtol=0,
                     atol=0,
                 )
-        old = DNQSM(ModelConfig((2, 4), filter_laplacian_residual=False))
+        old = DNQSM(laplacian_model_config((2, 4), filter_laplacian_residual=False))
         with self.assertRaisesRegex(ValueError, "different filtering architecture"):
             model.initialize_from(old)
         with self.assertRaisesRegex(ValueError, "Laplacian residual"):
-            ModelConfig(filter_laplacian_residual=True)
+            laplacian_model_config(filter_laplacian_residual=True)
 
 
 if __name__ == "__main__":

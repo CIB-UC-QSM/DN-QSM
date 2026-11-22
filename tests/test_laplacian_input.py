@@ -6,10 +6,11 @@ from pathlib import Path
 
 import torch
 
-from dnqsm.model import DNQSM, ModelConfig
+from dnqsm.model import DNQSM
 from dnqsm.physics import apply_multiplier, cutoff_kernels, dipole_tensor, masked_rms
 from dnqsm.runtime import load_trained_model
 from dnqsm.training import TrainConfig, model_config, parse_args
+from tests.helpers import laplacian_model_config
 
 
 class LaplacianInputTests(unittest.TestCase):
@@ -18,7 +19,7 @@ class LaplacianInputTests(unittest.TestCase):
         torch.set_num_threads(2)
 
     def test_impulse_reaches_filter_as_only_exact_laplacian_channel(self):
-        model = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0))
+        model = DNQSM(laplacian_model_config((2, 4), conditional_laplacian_threshold=0))
         phase = torch.zeros(2, 1, 9, 11, 13)
         phase[0, 0, 4, 5, 6] = 0.02
         phase[1, 0, 4, 5, 6] = 0.1
@@ -50,7 +51,9 @@ class LaplacianInputTests(unittest.TestCase):
         torch.testing.assert_close(physical_channels, expected)
 
     def test_laplacian_has_expected_polynomial_response_interior(self):
-        model = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0)).eval()
+        model = DNQSM(
+            laplacian_model_config((2, 4), conditional_laplacian_threshold=0)
+        ).eval()
         grid = torch.arange(-4, 5, dtype=torch.float32)
         x, y, z = torch.meshgrid(grid, grid, grid, indexing="ij")
         phase = torch.stack((torch.ones_like(x), x * x + y * y + z * z, x * x - y * y))[
@@ -77,7 +80,7 @@ class LaplacianInputTests(unittest.TestCase):
         )
 
     def test_kernel_is_fixed_and_laplacian_preserves_input_gradients(self):
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(laplacian_model_config((2, 4)))
         original_kernel = model.laplacian_kernel.clone()
         self.assertEqual(original_kernel.shape, (1, 1, 3, 3, 3))
         self.assertFalse(model.laplacian_kernel.requires_grad)
@@ -111,7 +114,7 @@ class LaplacianInputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             for version, enabled in ((2, True), (1, True), (1, False)):
                 model = DNQSM(
-                    ModelConfig(
+                    laplacian_model_config(
                         (2, 4),
                         laplacian_input=enabled,
                         filter_input_version=version,
@@ -183,7 +186,7 @@ class LaplacianInputTests(unittest.TestCase):
             )
 
     def test_masked_output_is_the_exact_tkd_input_and_ignores_exterior(self):
-        model = DNQSM(ModelConfig((2, 4))).eval()
+        model = DNQSM(laplacian_model_config((2, 4))).eval()
         phase = (torch.randn(1, 1, 9, 11, 13) * 0.01).requires_grad_()
         mask = torch.zeros_like(phase)
         mask[..., 2:-2, 2:-2, 2:-2] = 1
@@ -213,7 +216,7 @@ class LaplacianInputTests(unittest.TestCase):
         # Zeroing the field outside the ROI is what costs the masked pipeline
         # its irreducible susceptibility error, because TKD then applies a
         # full-grid operator to a field the mask has already truncated.
-        config = ModelConfig(
+        config = laplacian_model_config(
             (2, 4),
             full_grid_field=True,
             filter_input_version=1,
@@ -240,7 +243,7 @@ class LaplacianInputTests(unittest.TestCase):
     def test_laplacian_only_input_also_supports_an_unmasked_output(self):
         # Input preprocessing and output masking are separable: the filter
         # still sees the Laplacian of the masked field either way.
-        config = ModelConfig((2, 4), full_grid_field=True)
+        config = laplacian_model_config((2, 4), full_grid_field=True)
         self.assertEqual(config.filter_input_version, 2)
         self.assertEqual(config.conditional_laplacian_threshold, 32.0)
         model = DNQSM(config).eval()
@@ -258,10 +261,10 @@ class LaplacianInputTests(unittest.TestCase):
         for options in (
             dict(residual_filter=True),
             dict(laplacian_input=False),
-            dict(filter_input_version=3),
+            dict(filter_input_version=4),
         ):
             with self.subTest(options=options), self.assertRaises(ValueError):
-                ModelConfig(**options)
+                laplacian_model_config(**options)
 
 
 if __name__ == "__main__":

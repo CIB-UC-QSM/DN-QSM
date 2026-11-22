@@ -70,7 +70,17 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         # Profiles that deliberately depart from the shared objective defaults.
         # Every other shipped config must still match them exactly.
-        opt_in = {"fullgrid_100epochs.json": dict(extension=1.0, local_tkd=1.0)}
+        opt_in = {
+            "fullgrid_100epochs.json": dict(extension=1.0, local_tkd=1.0),
+            "dual_field_100epochs.json": dict(
+                extension=1.0,
+                local_tkd=1.0,
+                harmonic_laplacian=100.0,
+                field_decomposition=1.0,
+            ),
+            "full_volume_best.json": dict(extension=1.0, local_tkd=1.0),
+            "full_volume_strided.json": dict(extension=1.0, local_tkd=1.0),
+        }
         configs = [(None, TrainConfig()), (None, OverfitConfig())]
         configs.extend(
             (path.name, parse_args(["--config", str(path)]))
@@ -120,7 +130,10 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         torch.testing.assert_close(expected["physics"], raw["physics"] / field_energy)
         factors = torch.tensor([0.2, 10.0]).reshape(2, 1, 1, 1, 1)
         scaled = Reconstruction(
-            *(value * factors for value in vars(prediction).values())
+            *(
+                value * factors if value is not None else None
+                for value in vars(prediction).values()
+            )
         )
         scaled_raw = per_sample_loss_terms(
             scaled,
@@ -139,7 +152,10 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         single_losses = []
         for index in range(2):
             single = Reconstruction(
-                *(value[index : index + 1] for value in vars(prediction).values())
+                *(
+                    value[index : index + 1] if value is not None else None
+                    for value in vars(prediction).values()
+                )
             )
             single_losses.append(
                 reconstruction_loss(
@@ -188,6 +204,7 @@ class CorrectiveObjectiveTests(unittest.TestCase):
                 (2, 4),
                 full_grid_field=True,
                 filter_input_version=1,
+                bias=True,
                 filter_laplacian_residual=False,
                 conditional_laplacian_threshold=0,
             )
@@ -197,7 +214,9 @@ class CorrectiveObjectiveTests(unittest.TestCase):
             model.filter.final.bias.fill_(1)
         result = model(full, mask, dipole)
         self.assertGreater(float(result.local_field[mask == 0].abs().sum()), 0)
-        inverse, _ = cutoff_kernels(dipole, model.config.threshold)
+        inverse, _ = cutoff_kernels(
+            dipole, model.config.threshold, model.config.cutoff_mode
+        )
         torch.testing.assert_close(
             result.tkd, apply_multiplier(result.local_field, inverse)
         )
@@ -301,7 +320,13 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         ):
             output = model(local, mask, dipole)
             loss, terms = reconstruction_loss(
-                output, local, chi, mask, dipole, local_full_target=full
+                output,
+                local,
+                chi,
+                mask,
+                dipole,
+                local_full_target=full,
+                input_field=local,
             )
             if diagnostic:
                 rng = torch.get_rng_state()
@@ -325,9 +350,9 @@ class CorrectiveObjectiveTests(unittest.TestCase):
         self.assertEqual(training_weights(config, 9, 10).physics, config.lambda_physics)
         with tempfile.TemporaryDirectory() as temporary:
             checkpoint = Path(temporary) / "old.pt"
-            # Version 5 predates TKD supervision, so its optimizer and
+            # Version 7 predates harmonic-mask erosion, so its optimizer and
             # scheduler cannot silently continue under the current objective.
-            for version in (2, 5):
+            for version in (2, 5, 7):
                 torch.save(dict(version=1, loss_version=version), checkpoint)
                 with self.subTest(loss_version=version):
                     with self.assertRaisesRegex(ValueError, "older loss"):

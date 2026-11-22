@@ -25,9 +25,13 @@ from .data import (
     collate_shapes,
     make_subject_split,
     shape_groups,
+    simulated_forward_field,
     training_records,
+    validate_voxel_size_range,
 )
 from .diagnostics import loss_gradient_metrics, quality_totals, summarize_quality
+from .inference import SlidingWindowConfig
+from .lesion_augmentation import LesionAugmentationConfig
 from .logging import RunLogger, filtering_figure, reconstruction_figure, write_json
 from .losses import (
     LOSS_VERSION,
@@ -39,12 +43,18 @@ from .losses import (
 )
 from .memory import ProcessMemoryMonitor
 from .model import DEFAULT_FEATURES, DNQSM, ModelConfig
-from .paths import RUNS_DIR, TRAINING_CACHE_DIR, TRAINING_DATA_DIR
-from .physics import apply_dipole, masked_nrmse
+from .paths import (
+    DEFAULT_TRAINING_CONFIG,
+    RUNS_DIR,
+    TRAINING_CACHE_DIR,
+    TRAINING_DATA_DIR,
+)
+from .physics import masked_nrmse
 from .runtime import (
     CHECKPOINT_VERSION,
     atomic_save,
     autocast_context,
+    configure_inference,
     configure_memory_budget,
     load_trained_model,
     require_device,
@@ -57,6 +67,7 @@ STOP_REQUESTED = False
 class TrainConfig:
     data_dir: str = str(TRAINING_DATA_DIR)
     source_manifest: str | None = None
+    original_samples_only: bool = False
     cache_dir: str = str(TRAINING_CACHE_DIR)
     run_dir: str = ""
     resume: str | None = None
@@ -65,6 +76,7 @@ class TrainConfig:
     cuda_memory_gb: float = 0.0
     cuda_allocator_config: str = ""
     epochs: int = 50
+    additional_epochs: int = 0
     filter_pretrain_epochs: int = 10
     training_schedule: str = "alternating"
     batch_size: int = 10
@@ -81,11 +93,16 @@ class TrainConfig:
     synthetic_fraction: float = 0.25
     crop_probability: float = 0.0
     crop_resize: bool = True
+    patch_size: int = 0
+    inference_overlap: float = 0.5
+    inference_sigma_scale: float = 0.125
+    inference_batch_size: int = 1
     chi_augmentation: dict | None = None
+    lesion_augmentation: dict | None = None
     chi_shape_validation: bool = False
     seed: int = 0
     features: tuple[int, ...] = DEFAULT_FEATURES
-    threshold: float = 0.2
+    threshold: float = 0.1
     scale_floor: float = 1e-6
     checkpoint_blocks: bool = True
     residual_filter: bool = False
@@ -99,6 +116,14 @@ class TrainConfig:
     filter_refinement_features: int = 0
     activation: str = "leaky_relu"
     leaky_relu_slope: float = 0.01
+    downsampling: str = "strided_conv"
+    bias: bool = False
+    laplacian_operator: str = "frequency"
+    laplacian_extension_iters: int = 6
+    laplacian_extension_mode: str = "quadratic"
+    field_normalization: str = "legacy"
+    normalization_layer: str = "instance"
+    cutoff_mode: str = "soft"
     normalize_loss: bool = True
     chi_loss_floor: float = 1e-4
     field_loss_floor: float = 1e-4
@@ -109,6 +134,8 @@ class TrainConfig:
     lambda_physics: float = 1.0
     lambda_extension: float = 0.0
     lambda_local_tkd: float = 0.0
+    lambda_harmonic_laplacian: float = 0.0
+    lambda_field_decomposition: float = 0.0
     physics_warmup_epochs: int = 0
     background_profile: str = "mixture"
     background_curriculum_epochs: int = 5
@@ -118,6 +145,8 @@ class TrainConfig:
     weak_probability: float = 0.1
     snr_min: float = 40.0
     snr_max: float = 100.0
+    voxel_size_min: float = 1.0
+    voxel_size_max: float = 1.0
     validation_synthesis: dict | None = None
     gradient_every: int = 100
     bf16: bool = True
@@ -131,19 +160,51 @@ class TrainConfig:
     max_val_subjects: int = 0
     evaluate_external: bool = True
     external_eval_every: int = 0
+    checkpoint_metric: str = "validation"
     evaluation_data_dir: str = ""
     cosmos_simulation: str | None = None
     sim2_pad: int = 20
 
     def validate(self) -> None:
+        if type(self.additional_epochs) is not int or self.additional_epochs < 0:
+            raise ValueError("Additional epochs must be a nonnegative integer")
+        if self.checkpoint_metric not in ("validation", "cosmos"):
+            raise ValueError("Checkpoint metric must be validation or cosmos")
+        if self.checkpoint_metric == "cosmos" and self.external_eval_every != 1:
+            raise ValueError(
+                "COSMOS checkpoint selection requires external_eval_every=1"
+            )
+        validate_voxel_size_range(self.voxel_size_min, self.voxel_size_max)
+        SlidingWindowConfig(
+            self.patch_size,
+            self.inference_overlap,
+            self.inference_sigma_scale,
+            self.inference_batch_size,
+        )
         if self.training_schedule not in ("alternating", "joint"):
             raise ValueError("Training schedule must be alternating or joint")
+        if type(self.patch_size) is not int or self.patch_size < 0:
+            raise ValueError(
+                "Patch size must be zero (full volume) or a positive integer"
+            )
+        if self.patch_size:
+            if self.patch_size < 2 ** (len(self.features) + 1):
+                raise ValueError(
+                    "Patch size is too small for the U-Net depth without padding"
+                )
+            if self.crop_probability:
+                raise ValueError("Post-simulation patches require crop_probability=0")
+        if self.original_samples_only and self.synthetic_fraction:
+            raise ValueError("Original-only training requires synthetic_fraction=0")
         if self.training_schedule == "alternating" and self.accumulation_steps != 1:
             raise ValueError(
                 "Alternating training requires accumulation_steps=1 so each batch "
                 "updates only one network"
             )
         policy = ChiAugmentationConfig.from_dict(self.chi_augmentation)
+        lesions = LesionAugmentationConfig.from_dict(self.lesion_augmentation)
+        if self.lesion_augmentation is not None:
+            self.lesion_augmentation = lesions.to_dict()
         if self.chi_augmentation is not None:
             self.chi_augmentation = policy.to_dict()
         if (
@@ -217,6 +278,14 @@ class TrainConfig:
             self.filter_refinement_features,
             self.activation,
             self.leaky_relu_slope,
+            self.downsampling,
+            self.bias,
+            self.laplacian_operator,
+            self.laplacian_extension_iters,
+            self.laplacian_extension_mode,
+            self.field_normalization,
+            self.normalization_layer,
+            self.cutoff_mode,
         )
         LossWeights(
             local=self.lambda_local,
@@ -225,6 +294,8 @@ class TrainConfig:
             physics=self.lambda_physics,
             extension=self.lambda_extension,
             local_tkd=self.lambda_local_tkd,
+            harmonic_laplacian=self.lambda_harmonic_laplacian,
+            field_decomposition=self.lambda_field_decomposition,
         )
         LossNormalization(
             self.chi_loss_floor, self.field_loss_floor, self.mse_input_ratio_cap
@@ -241,6 +312,11 @@ class TrainConfig:
         ):
             raise ValueError(
                 "Validation synthesis must be an object with background_mode"
+            )
+        if self.validation_synthesis is not None:
+            validate_voxel_size_range(
+                self.validation_synthesis.get("voxel_size_min", 1.0),
+                self.validation_synthesis.get("voxel_size_max", 1.0),
             )
         if (
             self.background_profile not in ("mixture", "ratio", "legacy")
@@ -281,6 +357,14 @@ def model_config(config: TrainConfig) -> ModelConfig:
         config.filter_refinement_features,
         config.activation,
         config.leaky_relu_slope,
+        config.downsampling,
+        config.bias,
+        config.laplacian_operator,
+        config.laplacian_extension_iters,
+        config.laplacian_extension_mode,
+        config.field_normalization,
+        config.normalization_layer,
+        config.cutoff_mode,
     )
 
 
@@ -302,6 +386,8 @@ def training_weights(config, step=0, warmup_steps=0):
         physics=config.lambda_physics,
         extension=config.lambda_extension,
         local_tkd=config.lambda_local_tkd,
+        harmonic_laplacian=config.lambda_harmonic_laplacian,
+        field_decomposition=config.lambda_field_decomposition,
     )
     if warmup_steps:
         weights = replace(
@@ -320,6 +406,8 @@ def background_options(config, progress=1.0):
         weak_probability=config.weak_probability,
         snr_min=config.snr_min,
         snr_max=config.snr_max,
+        voxel_size_min=config.voxel_size_min,
+        voxel_size_max=config.voxel_size_max,
     )
 
 
@@ -375,16 +463,26 @@ def phased_learning_rate_multiplier(config, step, updates_per_epoch):
 def checkpoint_training_config(saved: dict) -> dict:
     """Fill historical defaults without changing an existing run's behavior."""
     values = dict(saved)
+    values.setdefault("checkpoint_metric", "validation")
+    values.setdefault("additional_epochs", 0)
     # Resume reaches the loss-version guard rather than failing on an old key.
     values.pop("lambda_forward", None)
     values.setdefault("filter_input_version", 1)
     values.setdefault("filter_pretrain_epochs", 0)
     values.setdefault("training_schedule", "joint")
     values.setdefault("threshold", 0.1)
+    values.setdefault("cutoff_mode", "hard")
     values.setdefault("full_grid_field", False)
     values.setdefault("lambda_extension", 1.0 if values["full_grid_field"] else 0.0)
     values.setdefault("residual_filter", False)
     values.setdefault("crop_resize", False)
+    values.setdefault("voxel_size_min", 1.0)
+    values.setdefault("voxel_size_max", 1.0)
+    values.setdefault("patch_size", 0)
+    values.setdefault("inference_overlap", 0.5)
+    values.setdefault("inference_sigma_scale", 0.125)
+    values.setdefault("inference_batch_size", 1)
+    values.setdefault("original_samples_only", False)
     values.setdefault("laplacian_input", False)
     values.setdefault("laplacian_fp32", False)
     values.setdefault("conditional_laplacian_threshold", 0.0)
@@ -393,9 +491,27 @@ def checkpoint_training_config(saved: dict) -> dict:
     values.setdefault("filter_refinement_features", 0)
     values.setdefault("activation", "celu")
     values.setdefault("leaky_relu_slope", 0.01)
+    values.setdefault("downsampling", "max_pool")
+    values.setdefault("bias", True)
+    values.setdefault("laplacian_operator", "stencil")
+    values.setdefault("laplacian_extension_iters", 0)
+    values.setdefault("laplacian_extension_mode", "harmonic")
+    values.setdefault("field_normalization", "legacy")
+    values.setdefault("normalization_layer", "instance")
     values.setdefault("lambda_local_gradient", 0.0)
     values.setdefault("lambda_local_tkd", 0.0)
+    values.setdefault("lambda_harmonic_laplacian", 0.0)
+    values.setdefault("lambda_field_decomposition", 0.0)
     values.setdefault("chi_augmentation", None)
+    values.setdefault("lesion_augmentation", None)
+    if values["lesion_augmentation"] is not None:
+        values["lesion_augmentation"] = json.loads(
+            json.dumps(
+                LesionAugmentationConfig.from_dict(
+                    values["lesion_augmentation"]
+                ).to_dict()
+            )
+        )
     values.setdefault("chi_shape_validation", False)
     return values
 
@@ -409,13 +525,20 @@ def _predict_training_batch(
     include_extension,
     include_gradient=True,
     include_tkd=False,
+    include_harmonic=True,
+    include_decomposition=True,
 ):
     with autocast_context(device, bf16):
-        output = (
-            model.predict_local_field(data["phase"], data["mask"])
-            if filter_only
-            else model(data["phase"], data["mask"], data["dipole"])
-        )
+        if filter_only:
+            fields = (
+                model.predict_fields(data["phase"], data["mask"])
+                if model.training
+                else model.predict_fields_inference(data["phase"], data["mask"])
+            )
+            output = fields.local_field
+        else:
+            predict = model if model.training else model.infer
+            output = predict(data["phase"], data["mask"], data["dipole"])
     if filter_only:
         # Filtering-only batches are the only ones that update the filter under
         # the alternating schedule, so exterior and TKD supervision have to
@@ -431,10 +554,15 @@ def _predict_training_batch(
                 chi_target=data["chi"] if include_tkd else None,
                 dipole=data["dipole"] if include_tkd else None,
                 threshold=model.config.threshold if include_tkd else None,
+                cutoff_mode=model.config.cutoff_mode,
+                harmonic_field=fields.harmonic_field,
+                total_field=data["phase"],
+                include_harmonic=include_harmonic,
+                include_decomposition=include_decomposition,
             ),
             None,
         )
-    predicted_field = apply_dipole(output.chi, data["dipole"])
+    predicted_field = simulated_forward_field(output.chi, data)
     raw = per_sample_loss_terms(
         output,
         data["local"],
@@ -446,6 +574,9 @@ def _predict_training_batch(
         include_extension=include_extension,
         include_gradient=include_gradient,
         include_tkd=include_tkd,
+        input_field=data["phase"],
+        include_harmonic=include_harmonic,
+        include_decomposition=include_decomposition,
     )
     return output, raw, predicted_field
 
@@ -455,7 +586,11 @@ def _worker_init(_worker_id: int) -> None:
 
 
 def build_datasets(config: TrainConfig, directory: Path):
-    records = training_records(config.data_dir, config.source_manifest)
+    records = training_records(
+        config.data_dir,
+        config.source_manifest,
+        original_samples_only=config.original_samples_only,
+    )
     train, validation = make_subject_split(records, config.val_fraction, config.seed)
     split = dict(
         seed=config.seed,
@@ -490,6 +625,7 @@ def build_datasets(config: TrainConfig, directory: Path):
         crop_probability=config.crop_probability,
         crop_resize=config.crop_resize,
         chi_augmentation=config.chi_augmentation,
+        lesion_augmentation=config.lesion_augmentation,
     )
     # Fixed held-out views follow training's susceptibility distribution.
     validation_set = TrainingVolumes(
@@ -556,7 +692,9 @@ def backward_batch(
     samples = cropped = 0
     for shaped_batch in shape_groups(batch):
         data = synthesizer(
-            shaped_batch, **background_options(config, background_progress)
+            shaped_batch,
+            patch_size=config.patch_size,
+            **background_options(config, background_progress),
         )
         count = data["chi"].shape[0]
         fraction = count / group_samples
@@ -569,6 +707,8 @@ def backward_batch(
             bool(weights.extension),
             include_gradient=bool(weights.local_gradient) and not chi_only,
             include_tkd=bool(weights.local_tkd) and not chi_only,
+            include_harmonic=bool(weights.harmonic_laplacian) and not chi_only,
+            include_decomposition=bool(weights.field_decomposition) and not chi_only,
         )
         terms = {
             name: value.mean()
@@ -587,7 +727,15 @@ def backward_batch(
             if getattr(weights, name)
             and (
                 not chi_only
-                or name not in ("local", "local_gradient", "local_tkd", "extension")
+                or name
+                not in (
+                    "local",
+                    "local_gradient",
+                    "local_tkd",
+                    "extension",
+                    "harmonic_laplacian",
+                    "field_decomposition",
+                )
             )
         )
         if not bool(torch.isfinite(loss)):
@@ -616,6 +764,19 @@ def backward_batch(
                     profile
                 )
             totals["chi_fallback_samples"] += int(shaped_batch["chi_fallback"].sum())
+        if "lesion_count" in shaped_batch:
+            totals["lesion_samples"] += int((shaped_batch["lesion_count"] > 0).sum())
+            for name in (
+                "lesion_count",
+                "lesion_spheres",
+                "lesion_ellipsoids",
+                "lesion_skipped",
+                "lesion_dephasing_count",
+                "lesion_dephasing_signal_loss",
+                "lesion_dephasing_spikes",
+            ):
+                if name in shaped_batch:
+                    totals[name] += int(shaped_batch[name].sum())
         if "crop_applied" in shaped_batch:
             cropped += int(shaped_batch["crop_applied"].sum())
         del data, output, loss, terms, raw, value, predicted_field
@@ -653,6 +814,8 @@ def validate(
             bool(weights.extension),
             include_gradient=bool(weights.local_gradient),
             include_tkd=bool(weights.local_tkd),
+            include_harmonic=bool(weights.harmonic_laplacian),
+            include_decomposition=bool(weights.field_decomposition),
         )
         per_sample = {
             name: values.flatten()
@@ -805,9 +968,23 @@ def run_training(config: TrainConfig) -> Path:
             "log_every",
             "save_every_steps",
             "gradient_every",
+            "additional_epochs",
         }
         current = json.loads(json.dumps(asdict(config)))
         previous = checkpoint_training_config(json.loads(json.dumps(resume["config"])))
+        if config.additional_epochs != previous["additional_epochs"]:
+            previous_target = (
+                previous["filter_pretrain_epochs"]
+                + previous["epochs"]
+                + previous["additional_epochs"]
+            )
+            if (
+                config.additional_epochs < previous["additional_epochs"]
+                or resume["epoch"] < previous_target
+            ):
+                raise ValueError(
+                    "Additional epochs can only extend a completed training target"
+                )
         for key in (
             "crop_probability",
             "external_eval_every",
@@ -858,6 +1035,7 @@ def run_training(config: TrainConfig) -> Path:
         ),
     )
     model = DNQSM(model_config(config)).to(device)
+    configure_inference(model, asdict(config))
     if config.init_checkpoint:
         initialized = load_trained_model(config.init_checkpoint, "cpu")
         model.initialize_from(initialized)
@@ -925,12 +1103,14 @@ def run_training(config: TrainConfig) -> Path:
             version=CHECKPOINT_VERSION,
             loss_version=LOSS_VERSION,
             model_config=asdict(model.config),
+            inference_config=asdict(model.inference_config),
             model=model.state_dict(),
             config=asdict(config),
             step=step,
             epoch=epoch,
             next_batch=next_batch,
             best=best,
+            checkpoint_metric=config.checkpoint_metric,
             epoch_samples=epoch_samples,
             epoch_cropped=epoch_cropped,
             epoch_clipped=epoch_clipped,
@@ -948,6 +1128,47 @@ def run_training(config: TrainConfig) -> Path:
                 rng=_rng_state(),
             ),
             directory / "training_last.pt",
+        )
+
+    def save_best(score, checkpoint_epoch, phase):
+        nonlocal best
+        if score is None or not math.isfinite(score):
+            raise ValueError(
+                f"{config.checkpoint_metric} checkpoint selection requires finite chi_nrmse"
+            )
+        if score >= best:
+            return
+        selection_metric = f"{config.checkpoint_metric}_chi_nrmse"
+        atomic_save(
+            dict(
+                version=CHECKPOINT_VERSION,
+                loss_version=LOSS_VERSION,
+                physics_grid_version=2,
+                model_config=asdict(model.config),
+                inference_config=asdict(model.inference_config),
+                model=model.state_dict(),
+                step=step,
+                epoch=checkpoint_epoch,
+                best=score,
+                checkpoint_metric=config.checkpoint_metric,
+                selection_metric=selection_metric,
+                **{selection_metric: score},
+                validation_profile=validation_profile,
+                **phase,
+            ),
+            directory / "model_best.pt",
+        )
+        best = score
+        write_json(
+            directory / "best_checkpoint.json",
+            dict(
+                checkpoint=str((directory / "model_best.pt").resolve()),
+                checkpoint_metric=config.checkpoint_metric,
+                selection_metric=selection_metric,
+                chi_nrmse=best,
+                epoch=checkpoint_epoch,
+                step=step,
+            ),
         )
 
     try:
@@ -968,19 +1189,36 @@ def run_training(config: TrainConfig) -> Path:
             gpu_total_memory_gib=total_vram / 1024**3,
             crop_probability=config.crop_probability,
             crop_resize=config.crop_resize,
+            patch_size=config.patch_size,
+            original_samples_only=config.original_samples_only,
             external_eval_every=config.external_eval_every,
             physics_grid_version=2,
             validation_profile=validation_profile,
             normalize_loss=config.normalize_loss,
             full_grid_field=config.full_grid_field,
             laplacian_input=config.laplacian_input,
+            laplacian_operator=config.laplacian_operator,
+            laplacian_extension_iters=config.laplacian_extension_iters,
+            laplacian_extension_mode=config.laplacian_extension_mode,
+            field_normalization=config.field_normalization,
+            normalization_layer=config.normalization_layer,
+            cutoff_mode=config.cutoff_mode,
+            threshold=config.threshold,
+            checkpoint_metric=config.checkpoint_metric,
+            voxel_size_min=config.voxel_size_min,
+            voxel_size_max=config.voxel_size_max,
             filter_input_version=config.filter_input_version,
             filter_pretrain_epochs=config.filter_pretrain_epochs,
-            post_pretrain_epochs=config.epochs,
+            post_pretrain_epochs=config.epochs + config.additional_epochs,
+            scheduled_epochs=config.epochs,
+            additional_epochs=config.additional_epochs,
             training_schedule=config.training_schedule,
             **phase_metadata(config, epoch),
         )
-        while epoch < config.filter_pretrain_epochs + config.epochs:
+        while (
+            epoch
+            < config.filter_pretrain_epochs + config.epochs + config.additional_epochs
+        ):
             phase = phase_metadata(config, epoch)
             filter_only = epoch < config.filter_pretrain_epochs
             if config.max_steps and step >= config.max_steps:
@@ -1042,7 +1280,9 @@ def run_training(config: TrainConfig) -> Path:
                 )
                 for name, value in terms.items():
                     group_terms[name] += value
-                    if name.startswith("chi_") and name.endswith("_samples"):
+                    if (
+                        name.startswith("chi_") and name.endswith("_samples")
+                    ) or name.startswith("lesion_"):
                         epoch_chi_counts[name] += value
                 epoch_samples += sample_count
                 epoch_cropped += cropped_count
@@ -1226,23 +1466,8 @@ def run_training(config: TrainConfig) -> Path:
                 raise ValueError(
                     "All validation susceptibility references have zero energy"
                 )
-            if not filter_only and metrics["chi_nrmse"] < best:
-                best = metrics["chi_nrmse"]
-                atomic_save(
-                    dict(
-                        version=CHECKPOINT_VERSION,
-                        loss_version=LOSS_VERSION,
-                        physics_grid_version=2,
-                        model_config=asdict(model.config),
-                        model=model.state_dict(),
-                        step=step,
-                        epoch=epoch + 1,
-                        best=best,
-                        validation_profile=validation_profile,
-                        **phase,
-                    ),
-                    directory / "model_best.pt",
-                )
+            if not filter_only and config.checkpoint_metric == "validation":
+                save_best(metrics["chi_nrmse"], epoch + 1, phase)
             if (
                 not filter_only
                 and config.external_eval_every
@@ -1256,7 +1481,7 @@ def run_training(config: TrainConfig) -> Path:
                     )
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-                evaluation.evaluate_training_epoch(
+                external_metrics = evaluation.evaluate_training_epoch(
                     model,
                     cases,
                     directory,
@@ -1266,6 +1491,9 @@ def run_training(config: TrainConfig) -> Path:
                     epoch + 1,
                     config.bf16,
                 )
+                if config.checkpoint_metric == "cosmos":
+                    score = external_metrics.get("cosmos", {}).get("chi_nrmse")
+                    save_best(score, epoch + 1, phase)
             epoch += 1
             next_batch = 0
             epoch_samples = epoch_cropped = 0
@@ -1279,6 +1507,7 @@ def run_training(config: TrainConfig) -> Path:
                     step=step,
                     epoch=epoch,
                     best_chi_nrmse=best if math.isfinite(best) else None,
+                    checkpoint_metric=config.checkpoint_metric,
                     **phase_metadata(config, epoch),
                 ),
             )
@@ -1301,6 +1530,7 @@ def run_training(config: TrainConfig) -> Path:
                 step=step,
                 epoch=epoch,
                 best_chi_nrmse=best,
+                checkpoint_metric=config.checkpoint_metric,
                 **phase_metadata(config, epoch - 1),
             ),
         )
@@ -1334,6 +1564,7 @@ def run_training(config: TrainConfig) -> Path:
                 step=step,
                 epoch=epoch,
                 best_chi_nrmse=best,
+                checkpoint_metric=config.checkpoint_metric,
                 external_evaluation=config.evaluate_external,
                 **phase_metadata(config, epoch - 1),
             ),
@@ -1358,7 +1589,9 @@ def run_training(config: TrainConfig) -> Path:
             signal.signal(sig, handler)
 
 
-def parse_args(argv: list[str] | None = None) -> TrainConfig:
+def parse_args(
+    argv: list[str] | None = None, *, use_default_profile=False
+) -> TrainConfig:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--config", type=Path, help="JSON training configuration; CLI flags override it"
@@ -1377,7 +1610,11 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             kwargs["action"] = argparse.BooleanOptionalAction
         elif name == "features":
             kwargs.update(type=int, nargs="+")
-        elif name in ("validation_synthesis", "chi_augmentation"):
+        elif name in (
+            "validation_synthesis",
+            "chi_augmentation",
+            "lesion_augmentation",
+        ):
             kwargs["type"] = json.loads
         else:
             kwargs["type"] = (
@@ -1391,6 +1628,8 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
     overrides = vars(parser.parse_args(argv))
     values = asdict(defaults)
     config_file = overrides.pop("config", None)
+    if use_default_profile and not config_file and not overrides.get("resume"):
+        config_file = DEFAULT_TRAINING_CONFIG
     if config_file:
         if overrides.get("resume"):
             parser.error(
@@ -1401,6 +1640,17 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
             parser.error("Training JSON must contain only TrainConfig field names")
         if configured.get("resume"):
             parser.error("Use --resume for exact continuation, without a JSON profile")
+        # Existing profiles predate learned downsampling and bias-free layers.
+        configured.setdefault("downsampling", "max_pool")
+        configured.setdefault("bias", True)
+        configured.setdefault("laplacian_operator", "stencil")
+        configured.setdefault("laplacian_extension_iters", 0)
+        configured.setdefault("laplacian_extension_mode", "harmonic")
+        configured.setdefault("field_normalization", "legacy")
+        configured.setdefault("normalization_layer", "instance")
+        configured.setdefault("cutoff_mode", "hard")
+        configured.setdefault("voxel_size_min", 1.0)
+        configured.setdefault("voxel_size_max", 1.0)
         values.update(configured)
     if overrides.get("resume"):
         saved = torch.load(
@@ -1408,6 +1658,10 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
         )
         values.update(checkpoint_training_config(saved["config"]))
         values["init_checkpoint"] = None
+        if "additional_epochs" in overrides:
+            overrides["additional_epochs"] += values["additional_epochs"]
+    elif "additional_epochs" in overrides:
+        parser.error("--additional-epochs requires --resume")
     values.update(overrides)
     values["features"] = tuple(values["features"])
     result = TrainConfig(**values)
@@ -1416,7 +1670,7 @@ def parse_args(argv: list[str] | None = None) -> TrainConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
-    directory = run_training(parse_args(argv))
+    directory = run_training(parse_args(argv, use_default_profile=True))
     print(f"Run artifacts: {directory}")
 
 

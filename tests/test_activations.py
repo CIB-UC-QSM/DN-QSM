@@ -37,7 +37,7 @@ class ActivationTests(unittest.TestCase):
             torch.testing.assert_close(x.grad, torch.tensor([0.01, 0.01, 1.0, 1.0]))
 
     def test_decoder_upsampling_convolutions_use_leaky_relu(self):
-        network = UNet3D((2, 4)).eval()
+        network = UNet3D((2, 4), bias=True).eval()
         with torch.no_grad():
             for conv in network.up_convs:
                 conv.weight.zero_()

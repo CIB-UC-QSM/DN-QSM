@@ -24,7 +24,7 @@ from dnqsm.losses import LossWeights, reconstruction_loss
 from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import apply_dipole, continuous_dipole_kernel
 from dnqsm.training import TrainConfig, backward_batch, parse_args, run_training
-from tests.helpers import make_dataset
+from tests.helpers import laplacian_model_config, make_dataset
 
 
 class CropTrainingTests(unittest.TestCase):
@@ -277,7 +277,7 @@ class CropTrainingTests(unittest.TestCase):
 
     def test_capacity_and_native_frequency_coordinates(self):
         with torch.device("meta"):
-            model = DNQSM(ModelConfig((23, 47, 90)))
+            model = DNQSM(laplacian_model_config((23, 47, 90)))
         self.assertEqual(sum(p.numel() for p in model.parameters()), 6421407)
         self.assertLess(abs(6421407 / (2 * 3212515) - 1), 0.001)
         shape, spacing = (7, 9, 11), (1, 2, 3)

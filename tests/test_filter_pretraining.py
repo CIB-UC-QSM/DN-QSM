@@ -141,7 +141,11 @@ class FilterPretrainingTests(unittest.TestCase):
                     self.assertAlmostEqual(
                         row["loss"],
                         config.lambda_local * row["local"]
-                        + config.lambda_local_gradient * row["local_gradient"],
+                        + config.lambda_local_gradient * row["local_gradient"]
+                        + config.lambda_harmonic_laplacian
+                        * row.get("harmonic_laplacian", 0)
+                        + config.lambda_field_decomposition
+                        * row.get("field_decomposition", 0),
                         delta=1e-6 * max(1, abs(row["loss"])),
                     )
                 else:
@@ -318,9 +322,12 @@ class FilterPretrainingTests(unittest.TestCase):
         self.assertEqual(default.training_schedule, "alternating")
         self.assertEqual(default.filter_pretrain_epochs, 10)
         self.assertEqual(default.accumulation_steps, 1)
-        self.assertEqual(default.threshold, 0.2)
-        self.assertEqual(ModelConfig().threshold, 0.2)
-        self.assertEqual(OverfitConfig().threshold, 0.2)
+        self.assertEqual(default.threshold, 0.1)
+        self.assertEqual(ModelConfig().threshold, 0.1)
+        self.assertEqual(OverfitConfig().threshold, 0.1)
+        self.assertEqual(default.cutoff_mode, "soft")
+        self.assertEqual(ModelConfig().cutoff_mode, "soft")
+        self.assertEqual(OverfitConfig().cutoff_mode, "soft")
         with self.assertRaisesRegex(ValueError, "accumulation_steps=1"):
             replace(default, accumulation_steps=2).validate()
         replace(default, training_schedule="joint", accumulation_steps=2).validate()
@@ -344,10 +351,17 @@ class FilterPretrainingTests(unittest.TestCase):
                 dipole,
                 predicted_field=field,
                 include_extension=False,
+                input_field=field,
             )
         self.assertNotIn("extension", terms)
         loss, terms = reconstruction_loss(
-            output, field, field, mask, dipole, weights=LossWeights(extension=0)
+            output,
+            field,
+            field,
+            mask,
+            dipole,
+            weights=LossWeights(extension=0),
+            input_field=field,
         )
         self.assertNotIn("extension", terms)
         loss.backward()
@@ -434,6 +448,7 @@ class FilterPretrainingTests(unittest.TestCase):
                             config,
                             run_dir=str(root / "new"),
                             filter_input_version=2,
+                            laplacian_input=True,
                             full_grid_field=False,
                             residual_filter=False,
                             lambda_extension=0,

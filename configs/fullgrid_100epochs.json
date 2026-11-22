@@ -1,4 +1,6 @@
 {
+  "data_dir": "/home/mathias/Documents/PhD/wh_net/data/training/joint",
+  "cache_dir": "/home/mathias/Documents/PhD/DN-QSM/artifacts/cache/training",
   "features": [
     23,
     47,
@@ -125,8 +127,10 @@
   "min_lr_factor": 0.05,
   "grad_clip": 10.0,
   "learning_rate": 3e-05,
+  "cuda_memory_gb": 90.0,
   "cuda_allocator_config": "expandable_segments:True",
   "training_schedule": "alternating",
+  "evaluation_data_dir": "/home/mathias/Documents/PhD/wh_net/data/evaluation",
   "sim2_pad": 20,
   "clean_probability": 0.05,
   "weak_probability": 0.05,
@@ -147,6 +151,7 @@
   },
   "gradient_every": 100,
   "comet": true,
+  "comet_env_file": "/home/mathias/Documents/PhD/wh_net/.env",
   "evaluate_external": true,
   "external_eval_every": 1,
   "chi_shape_validation": true,

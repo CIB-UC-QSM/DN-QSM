@@ -41,7 +41,7 @@ class OverfitConfig:
     min_lr_factor: float = 0.05
     grad_clip: float = 10.0
     features: tuple[int, ...] = (54, 108, 216, 432, 864)
-    threshold: float = 0.2
+    threshold: float = 0.1
     checkpoint_blocks: bool = True
     residual_filter: bool = False
     full_grid_field: bool = False
@@ -54,6 +54,14 @@ class OverfitConfig:
     filter_refinement_features: int = 0
     activation: str = "leaky_relu"
     leaky_relu_slope: float = 0.01
+    downsampling: str = "strided_conv"
+    bias: bool = False
+    laplacian_operator: str = "frequency"
+    laplacian_extension_iters: int = 6
+    laplacian_extension_mode: str = "quadratic"
+    field_normalization: str = "legacy"
+    normalization_layer: str = "instance"
+    cutoff_mode: str = "soft"
     bf16: bool = True
     seed: int = 0
     threads: int = 4
@@ -71,6 +79,8 @@ class OverfitConfig:
     lambda_physics: float = 1.0
     lambda_extension: float = 0.0
     lambda_local_tkd: float = 0.0
+    lambda_harmonic_laplacian: float = 0.0
+    lambda_field_decomposition: float = 0.0
     physics_warmup_steps: int = 0
     gradient_every: int = 50
     comet: bool = False
@@ -123,6 +133,14 @@ class OverfitConfig:
             filter_refinement_features=self.filter_refinement_features,
             activation=self.activation,
             leaky_relu_slope=self.leaky_relu_slope,
+            downsampling=self.downsampling,
+            bias=self.bias,
+            laplacian_operator=self.laplacian_operator,
+            laplacian_extension_iters=self.laplacian_extension_iters,
+            laplacian_extension_mode=self.laplacian_extension_mode,
+            field_normalization=self.field_normalization,
+            normalization_layer=self.normalization_layer,
+            cutoff_mode=self.cutoff_mode,
         )
         LossWeights(
             local=self.lambda_local,
@@ -131,6 +149,8 @@ class OverfitConfig:
             physics=self.lambda_physics,
             extension=self.lambda_extension,
             local_tkd=self.lambda_local_tkd,
+            harmonic_laplacian=self.lambda_harmonic_laplacian,
+            field_decomposition=self.lambda_field_decomposition,
         )
         LossNormalization(self.chi_loss_floor, self.field_loss_floor)
         if min(self.physics_warmup_steps, self.gradient_every) < 0:
@@ -187,6 +207,7 @@ def _run_overfit(
         if (
             tuple(resumed["model_config"]["features"]) != tuple(config.features)
             or resumed["model_config"]["threshold"] != config.threshold
+            or resumed["model_config"].get("cutoff_mode", "hard") != config.cutoff_mode
             or resumed["model_config"].get("laplacian_input", False)
             != config.laplacian_input
             or resumed["model_config"].get("filter_input_version", 1)
@@ -204,9 +225,22 @@ def _run_overfit(
             or resumed["model_config"].get("activation", "celu") != config.activation
             or resumed["model_config"].get("leaky_relu_slope", 0.01)
             != config.leaky_relu_slope
+            or resumed["model_config"].get("downsampling", "max_pool")
+            != config.downsampling
+            or resumed["model_config"].get("bias", True) != config.bias
+            or resumed["model_config"].get("laplacian_operator", "stencil")
+            != config.laplacian_operator
+            or resumed["model_config"].get("laplacian_extension_iters", 0)
+            != config.laplacian_extension_iters
+            or resumed["model_config"].get("laplacian_extension_mode", "harmonic")
+            != config.laplacian_extension_mode
+            or resumed["model_config"].get("field_normalization", "legacy")
+            != config.field_normalization
+            or resumed["model_config"].get("normalization_layer", "instance")
+            != config.normalization_layer
         ):
             raise ValueError(
-                "Resume must preserve model capacity, filter input/precision, and TKD threshold"
+                "Resume must preserve model capacity, filter input/precision, and cutoff policy"
             )
         if (
             Path(resumed["config"]["cosmos_simulation"]).resolve()
@@ -226,6 +260,8 @@ def _run_overfit(
             "lambda_physics",
             "lambda_extension",
             "lambda_local_tkd",
+            "lambda_harmonic_laplacian",
+            "lambda_field_decomposition",
             "physics_warmup_steps",
         ):
             if getattr(config, name) != resumed["config"].get(name):
@@ -291,6 +327,14 @@ def _run_overfit(
             filter_refinement_features=config.filter_refinement_features,
             activation=config.activation,
             leaky_relu_slope=config.leaky_relu_slope,
+            downsampling=config.downsampling,
+            bias=config.bias,
+            laplacian_operator=config.laplacian_operator,
+            laplacian_extension_iters=config.laplacian_extension_iters,
+            laplacian_extension_mode=config.laplacian_extension_mode,
+            field_normalization=config.field_normalization,
+            normalization_layer=config.normalization_layer,
+            cutoff_mode=config.cutoff_mode,
         )
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -367,6 +411,8 @@ def _run_overfit(
         physics=config.lambda_physics,
         extension=config.lambda_extension,
         local_tkd=config.lambda_local_tkd,
+        harmonic_laplacian=config.lambda_harmonic_laplacian,
+        field_decomposition=config.lambda_field_decomposition,
     )
     normalization = (
         LossNormalization(config.chi_loss_floor, config.field_loss_floor)
@@ -412,6 +458,7 @@ def _run_overfit(
             weights,
             normalization=normalization,
             local_full_target=data["local_full"],
+            input_field=data["phase"],
         )
         metrics = {
             "loss": float(loss),
@@ -479,6 +526,7 @@ def _run_overfit(
                     active_weights,
                     normalization=normalization,
                     local_full_target=data["local_full"],
+                    input_field=data["phase"],
                 )
                 if not bool(torch.isfinite(loss)):
                     raise FloatingPointError("Nonfinite single-case training loss")
@@ -634,6 +682,7 @@ def main(argv: list[str] | None = None) -> None:
             overrides["resume"], weights_only=True, map_location="cpu", mmap=True
         )
         values.update(checkpoint["config"])
+        values["cutoff_mode"] = checkpoint["config"].get("cutoff_mode", "hard")
         values.pop("lambda_forward", None)
         values["laplacian_input"] = checkpoint["config"].get("laplacian_input", False)
         values["filter_input_version"] = checkpoint["config"].get(
@@ -654,9 +703,28 @@ def main(argv: list[str] | None = None) -> None:
         )
         values["activation"] = checkpoint["config"].get("activation", "celu")
         values["leaky_relu_slope"] = checkpoint["config"].get("leaky_relu_slope", 0.01)
+        values["downsampling"] = checkpoint["config"].get("downsampling", "max_pool")
+        values["bias"] = checkpoint["config"].get("bias", True)
+        values["laplacian_operator"] = checkpoint["config"].get(
+            "laplacian_operator", "stencil"
+        )
+        values["laplacian_extension_iters"] = checkpoint["config"].get(
+            "laplacian_extension_iters", 0
+        )
+        values["laplacian_extension_mode"] = checkpoint["config"].get(
+            "laplacian_extension_mode", "harmonic"
+        )
+        values["field_normalization"] = checkpoint["config"].get(
+            "field_normalization", "legacy"
+        )
+        values["normalization_layer"] = checkpoint["config"].get(
+            "normalization_layer", "instance"
+        )
         values["lambda_local_gradient"] = checkpoint["config"].get(
             "lambda_local_gradient", 0.0
         )
+        for name in ("lambda_harmonic_laplacian", "lambda_field_decomposition"):
+            values[name] = checkpoint["config"].get(name, 0.0)
         del checkpoint
     values.update(overrides)
     values["features"] = tuple(values["features"])

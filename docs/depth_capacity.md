@@ -1,8 +1,15 @@
 # Batch-size-10 depth capacity
 
+These measurements cover the historical max-pooling full-volume architecture.
+The new four-level `[32,64,128,256]` single-decoder default uses learned stride-2 convolutions
+and no layer biases, with 53,157,377 parameters. Its batch-size-10 capacity
+has not been measured by this study. The experimental version-3 five-level model has two
+phase decoders and 126,003,527 parameters; the figures below must not be treated
+as its memory budget.
+
 The previous training run was stopped cleanly at update 2,100. The capacity search selected six symmetric encoder/decoder levels with widths `[23, 47, 90, 180, 360, 720]` and a 1,440-channel bottleneck for both networks. The measured architecture contained **410,626,887 parameters** and 33 Conv3d layers per network, compared with 18 in the previous three-level model.
 
-The current defaults restore this measured concatenation architecture: **410,626,887 parameters**, 33 Conv3d layers in each network, raw-field concatenation before the phase output head, no Laplacian output addition, and no refinement block. The experimental Laplacian-residual and refinement variants retain their saved configurations for checkpoint loading.
+The measured historical concatenation architecture had **410,626,887 parameters**, 33 Conv3d layers in each network, raw-field concatenation before the phase output head, no Laplacian output addition, and no refinement block. It and the experimental Laplacian-residual and refinement variants retain their saved configurations for checkpoint loading.
 
 Current new models use LeakyReLU with slope 0.01; the capacity measurements used CELU. This activation change preserves parameter counts. Memory measurements have not been repeated with LeakyReLU.
 

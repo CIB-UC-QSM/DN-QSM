@@ -22,6 +22,7 @@ from .data import (
     ShapeFieldSynthesizer,
     TrainingVolumes,
     shape_groups,
+    simulated_forward_field,
 )
 from .diagnostics import loss_gradient_metrics, quality_totals, summarize_quality
 from .evaluation import load_cases
@@ -30,7 +31,6 @@ from .logging import _pyplot, write_json
 from .losses import normalize_loss_terms, per_sample_loss_terms
 from .model import Reconstruction, UNet3D
 from .physics import (
-    apply_dipole,
     apply_multiplier,
     cutoff_kernels,
     masked_nrmse,
@@ -40,6 +40,7 @@ from .runtime import (
     CHECKPOINT_VERSION,
     atomic_save,
     autocast_context,
+    configure_inference,
     configure_memory_budget,
     load_trained_model,
     require_device,
@@ -72,13 +73,18 @@ def forward_arm(model, data, arm):
     if arm != "frozen":
         raise ValueError("Unknown experiment arm")
     with torch.no_grad():
-        local = model.predict_local_field(data["phase"], data["mask"]).detach()
-        inverse, projection = cutoff_kernels(data["dipole"], model.config.threshold)
+        fields = model.predict_fields(data["phase"], data["mask"])
+        local = fields.local_field.detach()
+        inverse, projection = cutoff_kernels(
+            data["dipole"], model.config.threshold, model.config.cutoff_mode
+        )
         initial = apply_multiplier(local, inverse)
         scale = masked_rms(initial, data["mask"], model.config.scale_floor)
     residual = model.null_network(initial / scale).float() * scale
     correction = apply_multiplier(residual, projection)
-    return Reconstruction(local, initial, correction, initial + correction)
+    return Reconstruction(
+        local, initial, correction, initial + correction, fields.harmonic_field
+    )
 
 
 def phase_digest(model):
@@ -100,7 +106,12 @@ def draw_digest(batch):
             "chi_rms_target",
             "crop_start",
             "crop_shape",
+            "lesion_parameters",
         ):
+            if key == "lesion_parameters" and all(
+                value == "[]" for value in shaped.get(key, [])
+            ):
+                continue
             value = shaped[key]
             if isinstance(value, torch.Tensor):
                 value = value.tolist()
@@ -115,10 +126,12 @@ def arm_step(model, batch, synthesizer, optimizer, config, arm, *, diagnostics=F
     count_total = sum(group["chi"].shape[0] for group in shape_groups(batch))
     weights = training_weights(config)
     for group in shape_groups(batch):
-        data = synthesizer(group, **background_options(config, 1.0))
+        data = synthesizer(
+            group, patch_size=config.patch_size, **background_options(config, 1.0)
+        )
         with autocast_context(data["chi"].device, config.bf16):
             output = forward_arm(model, data, arm)
-        predicted_field = apply_dipole(output.chi, data["dipole"])
+        predicted_field = simulated_forward_field(output.chi, data)
         raw = per_sample_loss_terms(
             output,
             data["local"],
@@ -128,6 +141,10 @@ def arm_step(model, batch, synthesizer, optimizer, config, arm, *, diagnostics=F
             predicted_field=predicted_field,
             include_extension=False,
             include_gradient=bool(weights.local_gradient),
+            include_tkd=bool(weights.local_tkd),
+            input_field=data["phase"],
+            include_harmonic=bool(weights.harmonic_laplacian),
+            include_decomposition=bool(weights.field_decomposition),
         )
         normalized = normalize_loss_terms(
             raw,
@@ -158,6 +175,19 @@ def arm_step(model, batch, synthesizer, optimizer, config, arm, *, diagnostics=F
             totals[key] += value
         for profile in PROFILES:
             totals[f"chi_{profile}_samples"] += group["chi_profile"].count(profile)
+        if "lesion_count" in group:
+            totals["lesion_samples"] += int((group["lesion_count"] > 0).sum())
+            for name in (
+                "lesion_count",
+                "lesion_spheres",
+                "lesion_ellipsoids",
+                "lesion_skipped",
+                "lesion_dephasing_count",
+                "lesion_dephasing_signal_loss",
+                "lesion_dephasing_spikes",
+            ):
+                if name in group:
+                    totals[name] += int(group[name].sum())
         del data, output, predicted_field, raw, normalized, terms, loss
     for name, module in (("phase", model.filter), ("null", model.null_network)):
         parameters = [p for p in module.parameters() if p.requires_grad]
@@ -191,7 +221,7 @@ def evaluate_suite(model, dataset, config, synthesizer, synthesis_options=None):
             ),
         )
         with autocast_context(data["chi"].device, config.bf16):
-            output = model(data["phase"], data["mask"], data["dipole"])
+            output = model.infer(data["phase"], data["mask"], data["dipole"])
         values = reconstruction_metrics(
             output,
             data["chi"],
@@ -232,7 +262,7 @@ def evaluate_external(model, cases, config, device):
             x.to(device) for x in (case.phase, case.mask, case.dipole, case.chi)
         )
         with autocast_context(device, config.bf16):
-            output = model(phase, mask, dipole)
+            output = model.infer(phase, mask, dipole)
         local = case.local.to(device) if case.local is not None else None
         results[case.name] = reconstruction_metrics(
             output, chi, mask, dipole, local, threshold=model.config.threshold
@@ -251,6 +281,7 @@ def study_datasets(study, config, seed):
         crop_probability=config.crop_probability,
         crop_resize=config.crop_resize,
         chi_augmentation=config.chi_augmentation,
+        lesion_augmentation=config.lesion_augmentation,
     )
     representatives = {r["subject"]: r for r in reversed(split["validation"])}
     records = [representatives[s] for s in sorted(representatives)]
@@ -290,11 +321,15 @@ def make_anchor(study, seed, config):
         model.config.checkpoint_blocks,
         activation=model.config.activation,
         leaky_relu_slope=model.config.leaky_relu_slope,
+        downsampling=model.config.downsampling,
+        bias=model.config.bias,
+        normalization=model.config.normalization_layer,
     )
     atomic_save(
         dict(
             version=CHECKPOINT_VERSION,
             model_config=asdict(model.config),
+            inference_config=asdict(model.inference_config),
             model=model.state_dict(),
             seed=seed,
             phase="shared_phase20_fresh_null",
@@ -316,6 +351,7 @@ def run_arm(study, seed, arm, config, manifest, device, cases):
         return json.loads(final.read_text())
     anchor = make_anchor(study, seed, config)
     model = load_trained_model(anchor, device)
+    configure_inference(model, asdict(config))
     initial_phase_digest = phase_digest(model)
     configure_arm(model, arm)
     optimizer = torch.optim.AdamW(
@@ -686,6 +722,15 @@ def main(argv=None):
     manifest = json.loads((study / "manifest.json").read_text())
     config_values = json.loads(Path(manifest["pretrain_config"]).read_text())
     config_values.setdefault("lambda_local_gradient", 0.0)
+    config_values.setdefault("lambda_harmonic_laplacian", 0.0)
+    config_values.setdefault("lambda_field_decomposition", 0.0)
+    config_values.setdefault("downsampling", "max_pool")
+    config_values.setdefault("bias", True)
+    config_values.setdefault("laplacian_operator", "stencil")
+    config_values.setdefault("laplacian_extension_iters", 0)
+    config_values.setdefault("laplacian_extension_mode", "harmonic")
+    config_values.setdefault("field_normalization", "legacy")
+    config_values.setdefault("normalization_layer", "instance")
     config = TrainConfig(**config_values)
     config.validate()
     if config.accumulation_steps != 1 or config.lambda_extension:

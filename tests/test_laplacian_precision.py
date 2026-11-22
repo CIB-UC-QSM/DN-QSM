@@ -7,9 +7,10 @@ from pathlib import Path
 
 import torch
 
-from dnqsm.model import DNQSM, ModelConfig
+from dnqsm.model import DNQSM
 from dnqsm.runtime import load_trained_model
 from dnqsm.training import checkpoint_training_config, model_config, parse_args
+from tests.helpers import laplacian_model_config
 
 
 class LaplacianPrecisionTests(unittest.TestCase):
@@ -30,7 +31,7 @@ class LaplacianPrecisionTests(unittest.TestCase):
         return captured[0], output
 
     def test_constant_field_rejected_under_bf16_and_input_gradients_survive(self):
-        model = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0))
+        model = DNQSM(laplacian_model_config((2, 4), conditional_laplacian_threshold=0))
         field = torch.ones(1, 1, 16, 16, 16, requires_grad=True)
         feature, output = self.capture(model, field)
         self.assertEqual(feature.dtype, torch.float32)
@@ -43,7 +44,9 @@ class LaplacianPrecisionTests(unittest.TestCase):
 
     def test_historical_checkpoint_keeps_original_autocast_response(self):
         model = DNQSM(
-            ModelConfig((2, 4), laplacian_fp32=False, conditional_laplacian_threshold=0)
+            laplacian_model_config(
+                (2, 4), laplacian_fp32=False, conditional_laplacian_threshold=0
+            )
         ).eval()
         config = asdict(model.config)
         config.pop("laplacian_fp32")
@@ -64,7 +67,7 @@ class LaplacianPrecisionTests(unittest.TestCase):
             )
 
     def test_new_checkpoint_and_training_precision_roundtrip(self):
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(laplacian_model_config((2, 4)))
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "new.pt"
             torch.save(
@@ -80,7 +83,13 @@ class LaplacianPrecisionTests(unittest.TestCase):
         self.assertFalse(
             model_config(
                 parse_args(
-                    ["--no-laplacian-fp32", "--conditional-laplacian-threshold", "0"]
+                    [
+                        "--no-laplacian-fp32",
+                        "--conditional-laplacian-threshold",
+                        "0",
+                        "--laplacian-operator",
+                        "stencil",
+                    ]
                 )
             ).laplacian_fp32
         )

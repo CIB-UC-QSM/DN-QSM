@@ -111,27 +111,33 @@ def reconstruction_figure(batch: dict, prediction, title: str):
     predicted_local = prediction.local_field[:1]
     initial = prediction.tkd[:1]
     predicted_chi = prediction.chi[:1]
-    return comparison_figure(
-        [
-            ("Total field (ppm)", batch["phase"][:1] * mask, False),
-            ("Clean local field (ppm)", local * mask, False),
+    rows = [
+        ("Total field (ppm)", batch["phase"][:1] * mask, False),
+        ("Clean local field (ppm)", local * mask, False),
+        (
+            "Filtered local, " + nrmse_label(predicted_local, local, mask),
+            predicted_local * mask,
+            False,
+        ),
+        ("Local error (ppm)", (predicted_local - local) * mask, False),
+        ("Susceptibility ground truth (ppm)", chi * mask, True),
+        ("TKD, " + nrmse_label(initial, chi, mask), initial * mask, True),
+        (
+            "DN-QSM, " + nrmse_label(predicted_chi, chi, mask),
+            predicted_chi * mask,
+            True,
+        ),
+        ("Susceptibility error (ppm)", (predicted_chi - chi) * mask, True),
+    ]
+    if prediction.harmonic_field is not None:
+        rows.append(
             (
-                "Filtered local, " + nrmse_label(predicted_local, local, mask),
-                predicted_local * mask,
+                "Estimated harmonic field (ppm)",
+                prediction.harmonic_field[:1] * mask,
                 False,
-            ),
-            ("Local error (ppm)", (predicted_local - local) * mask, False),
-            ("Susceptibility ground truth (ppm)", chi * mask, True),
-            ("TKD, " + nrmse_label(initial, chi, mask), initial * mask, True),
-            (
-                "DN-QSM, " + nrmse_label(predicted_chi, chi, mask),
-                predicted_chi * mask,
-                True,
-            ),
-            ("Susceptibility error (ppm)", (predicted_chi - chi) * mask, True),
-        ],
-        title,
-    )
+            )
+        )
+    return comparison_figure(rows, title)
 
 
 class RunLogger:

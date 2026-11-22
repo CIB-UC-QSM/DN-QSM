@@ -23,7 +23,7 @@ from .logging import _pyplot, write_json
 from .losses import LOSS_VERSION
 from .memory import ProcessMemoryMonitor
 from .model import DNQSM
-from .runtime import configure_memory_budget, require_device
+from .runtime import configure_inference, configure_memory_budget, require_device
 from .training import (
     TrainConfig,
     _loader,
@@ -84,6 +84,7 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
         training_repeats=3,
         crop_probability=config.crop_probability,
         crop_resize=config.crop_resize,
+        patch_size=config.patch_size,
         loss_version=LOSS_VERSION,
         normalize_loss=config.normalize_loss,
         background_profile=config.background_profile,
@@ -96,6 +97,7 @@ def probe_batch(config: TrainConfig, directory: Path, fraction: float) -> dict:
             result["shape"] = list(shape)
             synthesizer = ShapeFieldSynthesizer(device)
             model = DNQSM(model_config(config)).to(device).train()
+            configure_inference(model, asdict(config))
             result["parameters"] = sum(p.numel() for p in model.parameters())
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=0, weight_decay=0, foreach=False

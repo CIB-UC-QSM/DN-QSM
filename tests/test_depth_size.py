@@ -11,27 +11,56 @@ import torch
 
 from dnqsm.depth_size import deepest_fitting, features_at_depth, probe_depth
 from dnqsm.model import DEFAULT_FEATURES, DNQSM, ModelConfig
-from dnqsm.training import TrainConfig, backward_batch
+from dnqsm.training import TrainConfig, backward_batch, parse_args
 from tests.helpers import make_dataset
 
 
 class DepthSizeTests(unittest.TestCase):
-    def test_defaults_deepen_both_networks_and_fix_batch_size(self):
+    def test_default_training_entrypoint_restores_full_volume_best_profile(self):
+        config = parse_args([], use_default_profile=True)
+        self.assertEqual(config.filter_input_version, 2)
+        self.assertTrue(config.full_grid_field)
+        self.assertTrue(config.laplacian_input)
+        self.assertEqual(config.features, (32, 64, 128, 256))
+        self.assertEqual(config.threshold, 0.1)
+        self.assertEqual(config.cutoff_mode, "soft")
+        self.assertEqual(config.checkpoint_metric, "cosmos")
+        self.assertEqual(config.patch_size, 0)
+        self.assertEqual(config.lambda_harmonic_laplacian, 0)
+        self.assertEqual(config.lambda_field_decomposition, 0)
+        self.assertTrue(config.original_samples_only)
+        self.assertEqual(config.synthetic_fraction, 0)
+        self.assertIsNone(config.init_checkpoint)
+        self.assertEqual(config.downsampling, "strided_conv")
+        self.assertFalse(config.bias)
+        override = parse_args(["--epochs", "30"], use_default_profile=True)
+        self.assertEqual(override.epochs, 30)
+        experimental = parse_args(
+            ["--config", "configs/dual_field_100epochs.json"], use_default_profile=True
+        )
+        self.assertEqual(
+            (experimental.filter_input_version, experimental.patch_size), (3, 64)
+        )
+
+    def test_defaults_use_four_level_single_field_full_volume_model(self):
         config = TrainConfig()
         self.assertEqual(config.batch_size, 10)
         self.assertEqual(config.features, DEFAULT_FEATURES)
         self.assertEqual(ModelConfig().features, DEFAULT_FEATURES)
         with torch.device("meta"):
             model = DNQSM()
-        self.assertEqual(len(model.filter.downs), 6)
-        self.assertEqual(len(model.null_network.downs), 6)
-        self.assertEqual(len(model.filter.up_blocks), 6)
-        self.assertEqual(len(model.null_network.up_blocks), 6)
-        self.assertEqual(sum(p.numel() for p in model.parameters()), 410626887)
-        for network in (model.filter, model.null_network):
+        self.assertEqual(len(model.filter.downs), 4)
+        self.assertEqual(len(model.null_network.downs), 4)
+        self.assertEqual(len(model.filter.up_blocks), 4)
+        self.assertFalse(hasattr(model.filter, "harmonic_decoder"))
+        self.assertEqual(len(model.null_network.up_blocks), 4)
+        self.assertEqual(sum(p.numel() for p in model.parameters()), 53157377)
+        for network, count in ((model.filter, 27), (model.null_network, 27)):
+            self.assertEqual(len(network.downsamples), 4)
+            self.assertEqual(network.bottleneck[0].out_channels, 512)
             self.assertEqual(
                 sum(isinstance(m, torch.nn.Conv3d) for m in network.modules()),
-                33,
+                count,
             )
 
     def test_different_depth_requires_fresh_initialization(self):

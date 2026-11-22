@@ -17,7 +17,7 @@ from .data import BalancedSourceSampler, ShapeFieldSynthesizer, TrainingVolumes
 from .logging import _pyplot, write_json
 from .memory import ProcessMemoryMonitor
 from .model import DNQSM
-from .runtime import configure_memory_budget, require_device
+from .runtime import configure_inference, configure_memory_budget, require_device
 from .training import (
     TrainConfig,
     _loader,
@@ -96,6 +96,7 @@ def probe_depth(config, directory, fraction=0.98):
                 internal_shape=[max(n, 2 ** (len(config.features) + 1)) for n in shape],
             )
             model = DNQSM(model_config(config)).to(device)
+            configure_inference(model, asdict(config))
             result["parameters"] = sum(p.numel() for p in model.parameters())
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=0, weight_decay=0, foreach=False

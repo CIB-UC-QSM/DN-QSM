@@ -8,11 +8,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from dnqsm.model import DNQSM, ModelConfig, UNet3D
+from dnqsm.model import DNQSM, UNet3D
 from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
 from dnqsm.training import checkpoint_training_config, model_config, parse_args
+from tests.helpers import laplacian_model_config
 
 
 class FilterOutputSkipTests(unittest.TestCase):
@@ -32,7 +33,7 @@ class FilterOutputSkipTests(unittest.TestCase):
         return field, mask
 
     def test_concatenates_raw_field_after_decoder_with_selected_scale_and_padding(self):
-        model = DNQSM(ModelConfig((2, 4))).eval()
+        model = DNQSM(laplacian_model_config((2, 4))).eval()
         field, mask = self.fields()
         field.requires_grad_()
         features, head_inputs = [], []
@@ -67,7 +68,7 @@ class FilterOutputSkipTests(unittest.TestCase):
         torch.testing.assert_close(field.grad, mask)
 
     def test_new_weight_starts_at_zero_and_receives_gradients(self):
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(laplacian_model_config((2, 4)))
         self.assertEqual(model.filter.final.in_channels, 3)
         self.assertEqual(model.null_network.final.in_channels, 2)
         self.assertEqual(
@@ -82,12 +83,12 @@ class FilterOutputSkipTests(unittest.TestCase):
 
     def test_warm_start_zero_extends_head_and_preserves_old_weights(self):
         old = DNQSM(
-            ModelConfig(
+            laplacian_model_config(
                 (2, 4), filter_output_skip=False, filter_laplacian_residual=False
             )
         ).eval()
         new = DNQSM(
-            ModelConfig(
+            laplacian_model_config(
                 (2, 4), filter_output_skip=True, filter_laplacian_residual=False
             )
         ).eval()
@@ -111,7 +112,7 @@ class FilterOutputSkipTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             for enabled in (False, True):
                 model = DNQSM(
-                    ModelConfig(
+                    laplacian_model_config(
                         (2, 4),
                         filter_output_skip=enabled,
                         filter_laplacian_residual=False,

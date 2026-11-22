@@ -8,11 +8,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from dnqsm.model import DNQSM, ModelConfig
+from dnqsm.model import DNQSM
 from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
 from dnqsm.training import checkpoint_training_config, model_config, parse_args
+from tests.helpers import laplacian_model_config
 
 
 class ConditionalScalingTests(unittest.TestCase):
@@ -21,7 +22,7 @@ class ConditionalScalingTests(unittest.TestCase):
         torch.set_num_threads(2)
 
     def test_samplewise_selection_feature_output_units_and_gradients(self):
-        model = DNQSM(ModelConfig((2, 4)))
+        model = DNQSM(laplacian_model_config((2, 4)))
         self.assertEqual(model.config.conditional_laplacian_threshold, 32)
         noise = (
             torch.randn(2, 1, 24, 24, 24, generator=torch.Generator().manual_seed(5))
@@ -67,9 +68,11 @@ class ConditionalScalingTests(unittest.TestCase):
         self.assertEqual(float(field.grad[mask == 0].abs().sum()), 0)
 
     def test_no_valid_stencil_falls_back_to_total_rms(self):
-        base = DNQSM(ModelConfig((2, 4), conditional_laplacian_threshold=0)).eval()
+        base = DNQSM(
+            laplacian_model_config((2, 4), conditional_laplacian_threshold=0)
+        ).eval()
         conditional = DNQSM(
-            ModelConfig((2, 4), conditional_laplacian_threshold=32)
+            laplacian_model_config((2, 4), conditional_laplacian_threshold=32)
         ).eval()
         conditional.load_state_dict(base.state_dict())
         field = torch.randn(1, 1, 12, 12, 12)
@@ -89,7 +92,9 @@ class ConditionalScalingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             for threshold in (0.0, 32.0):
                 model = DNQSM(
-                    ModelConfig((2, 4), conditional_laplacian_threshold=threshold)
+                    laplacian_model_config(
+                        (2, 4), conditional_laplacian_threshold=threshold
+                    )
                 ).eval()
                 config = asdict(model.config)
                 if not threshold:
@@ -111,7 +116,15 @@ class ConditionalScalingTests(unittest.TestCase):
                     )
         self.assertEqual(
             model_config(
-                parse_args(["--conditional-laplacian-threshold", "32"])
+                parse_args(
+                    [
+                        "--filter-input-version",
+                        "2",
+                        "--laplacian-input",
+                        "--conditional-laplacian-threshold",
+                        "32",
+                    ]
+                )
             ).conditional_laplacian_threshold,
             32,
         )
@@ -130,9 +143,11 @@ class ConditionalScalingTests(unittest.TestCase):
         )
         for value in (-1, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
-                ModelConfig(conditional_laplacian_threshold=value)
+                laplacian_model_config(conditional_laplacian_threshold=value)
         with self.assertRaises(ValueError):
-            ModelConfig(conditional_laplacian_threshold=32, laplacian_fp32=False)
+            laplacian_model_config(
+                conditional_laplacian_threshold=32, laplacian_fp32=False
+            )
 
 
 if __name__ == "__main__":

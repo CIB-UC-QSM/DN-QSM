@@ -154,7 +154,7 @@ class ObjectiveVersionTests(unittest.TestCase):
         self.assertEqual(restored["lambda_local_tkd"], 0.0)
 
     def test_objective_version_advanced_for_the_new_term(self):
-        self.assertEqual(LOSS_VERSION, 6)
+        self.assertEqual(LOSS_VERSION, 8)
 
 
 if __name__ == "__main__":

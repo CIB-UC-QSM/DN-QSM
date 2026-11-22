@@ -97,6 +97,10 @@ def quality_totals(prediction, data, *, predicted_field=None):
         f"bucket_{name}_samples": int(selected.sum())
         for name, selected in buckets.items()
     }
+    if "voxel_size" in data:
+        sizes = data["voxel_size"][:, 0]
+        totals["quality_voxel_size_mm_sum"] = float(sizes.sum())
+        totals["quality_voxel_size_mm_count"] = sizes.numel()
     for name, value, reference in comparisons:
         denominator = masked_mean(reference.square(), mask).sqrt().flatten()
         valid = denominator > 0
