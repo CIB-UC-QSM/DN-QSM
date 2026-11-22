@@ -1,0 +1,81 @@
+\documentclass[tikz,border=0pt]{standalone}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,graphicx}
+\usetikzlibrary{arrows.meta,calc}
+
+\definecolor{ink}{HTML}{183449}
+\definecolor{muted}{HTML}{586C7A}
+\definecolor{blue}{HTML}{286598}
+\definecolor{bluefill}{HTML}{EDF4FB}
+\definecolor{gold}{HTML}{9C702D}
+\definecolor{goldfill}{HTML}{FCF5E8}
+\definecolor{teal}{HTML}{287D6E}
+
+\begin{document}
+\begin{tikzpicture}[
+    x=1mm,y=1mm,text=ink,font=\fontsize{10}{11.5}\selectfont,
+    card/.style={rounded corners=2mm,line width=.8pt,
+        minimum height=21mm,align=center,inner sep=2mm},
+    learned/.style={card,draw=blue,fill=bluefill,text width=26mm},
+    analytic/.style={card,draw=gold,fill=goldfill,text width=29mm},
+    flow/.style={-{Latex[length=2mm,width=1.5mm]},draw=ink,line width=.9pt},
+    note/.style={font=\fontsize{8.5}{10}\selectfont,text=muted,align=center}
+]
+    \fill[white] (0,0) rectangle (150,100);
+
+    \node[anchor=west,inner sep=0pt,font=\fontsize{27}{29}\selectfont\bfseries]
+        at (7,90) {DN-QSM};
+    \node[anchor=east,rounded corners=1.5mm,fill=blue,text=white,
+        inner xsep=3mm,inner ysep=2mm,font=\fontsize{10}{11}\selectfont]
+        at (143,90) {Deep Null Networks};
+    \node[anchor=west,inner sep=0pt,font=\fontsize{12}{14}\selectfont,text=muted]
+        at (7,80) {Physics-guided susceptibility mapping};
+
+    \node[inner sep=0pt] (input) at (15.5,59)
+        {\includegraphics[width=23mm,height=26mm,keepaspectratio]{assets/total_field.png}};
+    \node[font=\bfseries] at (15.5,75) {Total field};
+    \node[note] at (15.5,42) {+ brain mask};
+
+    \node[learned,text width=28mm,font=\fontsize{9.5}{11}\selectfont] (field) at (49,59)
+        {\textbf{Laplacian +}\\\mbox{\textbf{field estimation}}\\[-1pt]
+        {\fontsize{8}{9}\selectfont 3D U-Net}};
+    \node[analytic] (inverse) at (88,59)
+        {\textbf{Tikhonov}\\\textbf{regularized}\\\textbf{inverse}};
+    \node[circle,draw=teal,fill=white,line width=1pt,
+        minimum size=6mm,inner sep=0pt,font=\large] (add) at (117,59) {$+$};
+
+    \node[inner sep=0pt] (output) at (136,59)
+        {\includegraphics[width=23mm,height=26mm,keepaspectratio]{assets/final_qsm.png}};
+    \node[font=\bfseries,text=teal] at (136,75) {Final QSM};
+
+    \draw[flow] (input.east) -- (field.west);
+    \draw[flow] (field.east) -- (inverse.west);
+    \node[note] at (68.5,73) {Local field};
+    \draw[flow] (inverse.east) -- (add.west);
+    \draw[flow,draw=teal] (add.east) -- (output.west);
+
+    \node[learned,minimum height=18mm,text width=28mm] (residual) at (56,28)
+        {\textbf{Residual network}\\[-1pt]{\fontsize{8}{9}\selectfont 3D U-Net}};
+    \node[analytic,minimum height=18mm,text width=28mm] (null) at (97,28)
+        {\textbf{Regularized}\\\textbf{null projection}};
+
+    \coordinate (initial) at (110,59);
+    \fill[ink] (initial) circle (.6mm);
+    \draw[flow] (initial) -- (110,43) -- (56,43) -- (residual.north);
+    \node[note,fill=white,inner xsep=1.5mm,inner ysep=.3mm]
+        at (81,43) {Initial QSM};
+    \draw[flow] (residual.east) -- (null.west);
+    \draw[flow,draw=teal] (null.east) -- (117,28) -- (add.south);
+    \node[note,text=teal,anchor=west,inner sep=0pt] at (121,34)
+        {Learned\\correction};
+
+    \draw[ink!12,line width=.5pt] (7,15) -- (143,15);
+    \node[font=\fontsize{13}{15}\selectfont] at (75,7.7)
+        {\textcolor{gold}{Analytic inversion}\enspace$+$\enspace
+         \textcolor{blue}{Learned correction}};
+
+    \pgfresetboundingbox
+    \path[use as bounding box] (0,0) rectangle (150,100);
+\end{tikzpicture}
+\end{document}

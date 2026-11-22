@@ -1,0 +1,50 @@
+{
+  "title": "DN-QSM: Laplacian Field Estimation and Regularized Null Correction for Quantitative Susceptibility Mapping",
+  "synopsis": {
+    "Motivation": "Background fields and ill-conditioned dipole inversion limit quantitative susceptibility mapping.",
+    "Goal(s)": "Evaluate reconstruction combining learned field estimation, analytic inversion, and learned correction.",
+    "Approach": "Two 3D U-Nets were linked through a Tikhonov-regularized inverse and regularized null projection, then assessed using a COSMOS simulation and Graz1 data.",
+    "Results": "On COSMOS, correction reduced NRMSE from 44.38% to 37.36%; supplied iQSM and pretrained NeXtQSM reconstructions yielded 48.97% and 76.96%. Graz1 provided qualitative assessment without ground truth."
+  },
+  "impact": "DN-QSM provides QSM researchers with an explicit separation of field estimation, analytic inversion, and learned correction. Preliminary improvements on COSMOS support further investigation, while Graz1 illustrates application to additional data without establishing clinical accuracy.",
+  "body": {
+    "INTRODUCTION": "Quantitative susceptibility mapping (QSM) is challenged by background-field contamination and poorly conditioned dipole inversion.[1] Learned pipelines, including NeXtQSM[2] and iQSM,[3] offer alternatives to conventional multistep reconstruction. We propose DN-QSM, which combines Laplacian-based local-field estimation with an explicit Tikhonov inverse and learned residual correction. The aim was to assess whether regularized null correction improves the initial reconstruction in a COSMOS-based simulation and to examine application to Graz1 data.",
+    "METHODS": "DN-QSM contains two independent 3D U-Nets (Figure 1). The masked total field is centered and extended across the mask boundary before applying a Fourier-domain discrete Laplacian. Derivative-RMS normalization and a normalized-field skip support local-field estimation by the first network. A Tikhonov-regularized inverse, $K_\\tau=D/(D^2+\\tau^2)$, produces initial susceptibility, where $D$ is the dipole kernel and $\\tau=0.1$. The second network predicts an RMS-normalized residual. After rescaling, a regularized null projection, $P_\\tau=\\tau^2/(D^2+\\tau^2)$, emphasizes poorly conditioned dipole frequencies before the correction is added to the initial susceptibility. This projection is a continuous spectral weighting.\n\nFinal joint training used 105 original susceptibility samples, split into 95 training and 10 validation samples. Simulated fields included exterior-source backgrounds and noise; augmentation included susceptibility lesions and localized dephasing. Losses supervised local fields, field gradients, exterior fields, initial and final susceptibility, and dipole forward consistency. A previously trained checkpoint was fine-tuned for 30 epochs using AdamW, batch size 8, and an initial learning rate of $3\\times10^{-5}$. Epoch 18 was selected by COSMOS susceptibility NRMSE.\n\nEvaluation used one fixed COSMOS-based simulation (160-cubed reference grid, 1-mm spacing, SNR 100) with simulated background and noise. Whole-mask NRMSE was calculated without intensity fitting or mean removal. Comparators were the Tikhonov initialization, published pretrained NeXtQSM, and supplied iQSM reconstructions. Graz1 comprised six echoes (TE 4.92-29.52 ms; native voxels approximately 0.80 by 0.80 by 2.0 mm). Its supplied unwrapped phase was fitted using magnitude-squared weighting, converted to ppm, and resampled to 1-mm isotropic resolution. DN-QSM retained its original inference grids (COSMOS 184-cubed; Graz1 201-cubed), whereas NeXtQSM used 192-cubed and 256-cubed grids. Outputs were cropped to common brain regions. Graz1 was assessed qualitatively because reference susceptibility was unavailable.",
+    "RESULTS": "COSMOS susceptibility NRMSE was 44.38% for the Tikhonov initialization, 37.36% for final DN-QSM, 48.97% for the supplied iQSM reconstruction, and 76.96% for NeXtQSM (Figure 2). Learned correction reduced initialization NRMSE by 7.02 percentage points, or 15.8% relatively. Corresponding error maps show the spatial distribution of residual errors. In Graz1, all methods produced anatomically recognizable susceptibility maps with differing tissue and vascular contrast; streaking remained visible near strong susceptibility sources (Figure 3). No ground-truth accuracy or statistical significance was inferred from this single dataset.",
+    "DISCUSSION": "The COSMOS results support combining an analytic inverse with a learned correction weighted toward poorly conditioned frequencies. The explicit decomposition separates the initialization from the model's added contribution. These findings are preliminary: COSMOS also guided checkpoint selection, only one simulation and one Graz1 dataset were evaluated, and training-data independence from the reference requires confirmation. Comparator padding and preprocessing were not fully harmonized, and original iQSM inference settings were unavailable. The current results therefore do not establish independent generalization or clinical superiority. Further evaluation should control preprocessing and padding, verify data separation, and include additional subjects and acquisition protocols.",
+    "CONCLUSION": "DN-QSM reduced COSMOS development-case NRMSE through learned regularized null correction and generated susceptibility maps on Graz1. Larger independent evaluations are required to determine reconstruction robustness and quantitative accuracy beyond this preliminary comparison."
+  },
+  "references": [
+    "Liu T, Spincemaille P, de Rochefort L, et al. Calculation of susceptibility through multiple orientation sampling (COSMOS). Magn Reson Med. 2009;61:196-204. doi:10.1002/mrm.21828.",
+    "Cognolato F, O'Brien K, Jin J, et al. NeXtQSM. Med Image Anal. 2023;84:102700. doi:10.1016/j.media.2022.102700.",
+    "Gao Y, Xiong Z, Fazlollahi A, et al. Instant tissue field and magnetic susceptibility mapping from MRI raw phase using Laplacian enhanced deep neural networks. Neuroimage. 2022;259:119410. doi:10.1016/j.neuroimage.2022.119410."
+  ],
+  "figures": [
+    {
+      "number": 1,
+      "name": "Architecture",
+      "caption": "DN-QSM overview. Laplacian preprocessing precedes learned local-field estimation. A Tikhonov-regularized inverse gives initial susceptibility. A second network predicts a residual, which passes through a regularized null projection and is added to the initial estimate. Blue: learned networks; gold: fixed operators."
+    },
+    {
+      "number": 2,
+      "name": "COSMOS",
+      "caption": "COSMOS reconstructions (top) and signed differences from the reference (bottom). Columns: NeXtQSM, iQSM, Tikhonov initialization (labelled Soft-TKD), final DN-QSM, ground truth. NRMSE is calculated over the full 3D brain mask. Gray display limits: +/-0.1 ppm for susceptibility and +/-0.02 ppm for differences."
+    },
+    {
+      "number": 3,
+      "name": "Graz1",
+      "caption": "Graz1 reconstructions. Columns: NeXtQSM, supplied iQSM2 reconstruction, Tikhonov initialization (labelled Soft-TKD), final DN-QSM. Each column contains the same central axial, sagittal, and coronal views. Gray display limits are +/-0.1 ppm. No reference susceptibility was available; NRMSE is therefore omitted."
+    }
+  ],
+  "acknowledgements": "Funding and data-use acknowledgements: [authors to complete]. DN-QSM public code and training/evaluation data links: [authors to provide]. The official NeXtQSM implementation was obtained from https://github.com/QSMxT/NeXtQSM. Sources and permissions for the supplied iQSM reconstructions: [authors to confirm].",
+  "author_notes": [
+    "Add authors, affiliations, presenting-author information, funding, and final data-use acknowledgements in the submission portal. These are not part of the blinded abstract body.",
+    "Confirm the provenance and independence of the 105 original samples, the COSMOS reference, and Graz1; do not equate samples with independent participants. Confirm whether Graz1 is acquired, modified, or blended data and provide the applicable acquisition and ethics/consent details.",
+    "Verify the earlier checkpoint's complete training history. The reported 30 epochs describe only the final fine-tuning stage; this is not training from scratch.",
+    "Confirm that the supplied iQSM files were reconstructed from the intended COSMOS and Graz1 inputs, and document iQSM version, settings, and output units. Their input/inference provenance is not available in the current files.",
+    "COSMOS was used for checkpoint selection, so the reported NRMSE is a development-case result. Original training/reference overlap has not been established. No claims of independent test-set performance, population significance, or clinical superiority are made.",
+    "Method-specific padding is preserved. DN-QSM uses 184-cubed/201-cubed grids, and NeXtQSM uses 192-cubed/256-cubed grids. Padding changes can alter DN-QSM outputs, so future comparisons should report and control this choice.",
+    "Figure labels Soft-TKD refer to the Tikhonov-regularized initialization, not hard thresholding. The regularized null projection is a smooth spectral weighting, not a strict orthogonal null-space projection.",
+    "NeXtQSM is written as Next-QSM in the existing image headings. Both labels refer to the official published NeXtQSM model. Figure 3 uses the updated iQSM2 file whose SHA256 is recorded in the source provenance."
+  ]
+}
