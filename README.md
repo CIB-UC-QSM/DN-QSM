@@ -193,3 +193,33 @@ The evaluation `summary.json` reports each arm's scores and differences in
 susceptibility NRMSE in percentage points. Negative differences mean lower error
 for the later arm. Each case also includes per-arm figures, padded predictions,
 and reconstructed maps in the source geometry.
+
+The comparison script trains each of the six stages for five full epochs,
+validates at the end of each epoch, and evaluates all eight arms on COSMOS and
+sim2. The CUDA budget defaults to 90 GiB and reserves 1 GiB for allocations
+outside the PyTorch allocator.
+
+```sh
+uv run --env-file .env python scripts/run_comparison.py \
+  --patch-dir /WorkSpace/D/DN-QSM/artifacts/ahead-qsm-patches \
+  --output-dir artifacts/comparison-five-epochs
+```
+
+The script uses the same benchmark discovery as `dnqsm-compare`. Pass
+`--cosmos-simulation` and `--data-dir` to select explicit inputs. Checkpoints,
+validation history, and per-stage batch sizes are in `training/` under the run
+directory. Run directories are rooted at `/Workspace/D/DN-QSM` or
+`/WorkSpace/D/DN-QSM` on hosts with that mount spelling. Omit `--output-dir`
+to generate a unique run directory. Each training stage has its own Comet
+experiment with epoch and optimizer step on its metrics. For a short test,
+pass `--steps 10 --validation-interval 10`. The
+`evaluation/` directory contains the benchmark summary and per-arm outputs.
+The evaluation experiment shares the training experiments' Comet tag and logs
+metrics and central-slice images for each dataset and arm. Offline archives for
+both phases are saved in `training/comet/`.
+
+The default architecture and 90 GiB budget use measured per-stage batch sizes
+on the RTX PRO 6000 Blackwell Max-Q. Other CUDA configurations probe
+automatically. Use `--probe-batch-sizes` to recalibrate or `--batch-size` to
+supply one batch size for every stage. The probe runs two optimizer updates
+per candidate and restores the stage's initial weights before training starts.
