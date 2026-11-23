@@ -145,3 +145,51 @@ the mask is binary, and batched volumes have shape `[N, 1, 64, 64, 64]`.
 The patch-grid dipole is for DN-QSM inference and analytic initialization.
 The stored local-field target includes contributions from susceptibility
 outside the crop on the full simulation grid.
+
+## Train and compare baselines
+
+Train the direct total-field U-Net, the shared local-field estimator, and
+the four correction networks on the materialized AHEAD patches.
+
+```sh
+uv run dnqsm-train-comparison \
+  --patch-dir /WorkSpace/D/DN-QSM/artifacts/ahead-qsm-patches \
+  --output-dir artifacts/baseline-training
+
+uv run dnqsm-compare \
+  --manifest artifacts/baseline-training/comparison.json \
+  --cosmos-simulation /path/to/cosmos/run/simulation.pt \
+  --data-dir /path/to/sim2/evaluation \
+  --output-dir artifacts/baseline-evaluation
+```
+
+Model 1 directly predicts susceptibility. Model 2 applies clipped TKD,
+Tikhonov, or full-dipole linear gradient descent after local-field estimation.
+Model 3 learns a separate unrestricted correction for each inverse. Model 4
+uses Tikhonov and applies DN-QSM's spectral weighting to the learned correction.
+Models 2–4 share frozen local-field weights. Use the Tikhonov arms to compare
+inversion alone, unrestricted correction, and spectrally weighted correction.
+
+Training defaults to 10,000 updates per stage, with validation every 1,000
+updates on fixed backgrounds. AHEAD validation determines the saved checkpoints.
+Use `--device cpu --features 2 --steps 1 --batch-size 1` for a small test dataset.
+
+Each training stage has a Comet experiment. A shared tag links the six stages,
+and the local manifests record the experiment keys. Comet records relative MSE
+at each optimizer update and subject-averaged NRMSE at each validation, including
+the final update. Each validation also logs three central views of the same fixed
+patch with total field, reference, and prediction on a common ppm scale.
+
+Run `uv run comet login` or set `COMET_API_KEY` to upload automatically. To load
+the key from a local file, set `COMET_API_KEY` in the Git-ignored `.env` and
+start training with `uv run --env-file .env dnqsm-train-comparison` followed by
+the usual arguments. The default project is `dn-qsm`. Set `COMET_WORKSPACE` or
+`COMET_PROJECT_NAME` to choose the destination. Without credentials, or with
+`COMET_START_ONLINE=0`, training saves archives under `<output-dir>/comet/`.
+After logging in, upload an archive with `uv run comet upload <path-to-archive.zip>`.
+
+Evaluation defaults to Gaussian 64³ CNN windows and full-grid inversion.
+The evaluation `summary.json` reports each arm's scores and differences in
+susceptibility NRMSE in percentage points. Negative differences mean lower error
+for the later arm. Each case also includes per-arm figures, padded predictions,
+and reconstructed maps in the source geometry.
