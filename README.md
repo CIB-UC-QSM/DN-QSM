@@ -98,3 +98,50 @@ the source affine for sim2.
 Research notes, experiment plans, abstract drafts, and figure sources are in
 [docs/](docs/). Use Git commit `358ef51` to consult the earlier synthesis and
 training workflows, experiment configurations, and scripts referenced there.
+
+## AHEAD QSM patch generation
+
+Generate training and validation patches from the paired AHEAD tensors.
+
+```sh
+uv run dnqsm-generate-patches \
+  --source-dir /WorkSpace/D/DN-QSM/data/ahead-original105 \
+  --output-dir /WorkSpace/D/DN-QSM/artifacts/ahead-qsm-patches
+```
+
+The full dataset uses about 196 GiB for the patch arrays. The generator stages
+the output and publishes it as a new directory when complete. Use `--workers`
+to control CPU parallelism and `--seed` to reproduce the split and background
+sources.
+
+The generator applies the brain mask and keeps all 64³ crops on a six-voxel
+stride with at most 20% exactly zero susceptibility voxels. Training includes the
+original, positive-only scaling by four, and the sign inversion of each.
+Validation uses the original susceptibility. Fields are simulated on the padded
+full source volume before cropping. The manifest records the source split, crop
+coordinates, and the four exterior susceptibility maps' parameters per subject.
+The `qc/volumes` and `qc/patches` directories show the three tensor-axis center
+slices in grayscale with a fixed display range of −0.1 to +0.1. Use
+`uv run dnqsm-generate-patches --refresh-qc` to refresh the PNGs for the
+existing dataset.
+
+```python
+from dnqsm.patch_data import make_patch_dataloader
+
+loader = make_patch_dataloader(
+    "/WorkSpace/D/DN-QSM/artifacts/ahead-qsm-patches",
+    "train", batch_size=2, num_workers=2, seed=2026,
+)
+batch = next(iter(loader))
+dipole = loader.dataset.dipole()
+# With a DNQSM model on the same device:
+# prediction = model(batch["total_field"], batch["mask"], dipole)
+```
+
+Every read selects one of the subject's four saved background fields with
+replacement, including reads from the `validation` split. The sample reports
+the selected `background_option`. Fields and susceptibility are in ppm,
+the mask is binary, and batched volumes have shape `[N, 1, 64, 64, 64]`.
+The patch-grid dipole is for DN-QSM inference and analytic initialization.
+The stored local-field target includes contributions from susceptibility
+outside the crop on the full simulation grid.
