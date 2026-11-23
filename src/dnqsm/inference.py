@@ -181,18 +181,8 @@ def sliding_window_reconstruction(
     )
     initial = apply_multiplier(fields.local_field, inverse)
 
-    def predict(windows):
-        chi, roi = windows[:, :1], windows[:, 1:]
-        # In exterior-only windows use all voxels for scale. Null-network
-        # predictions remain unmasked before the global Fourier projection.
-        roi = torch.where(
-            roi.flatten(1).any(1)[:, None, None, None, None], roi, torch.ones_like(roi)
-        )
-        scale = masked_rms(chi, roi, model.config.scale_floor)
-        return model.null_network(chi / scale).float() * scale
-
-    residual = gaussian_sliding_window(
-        torch.cat((initial, mask.float()), dim=1), predict, config
+    residual = sliding_window_residual(
+        model.null_network, initial, mask, model.config.scale_floor, config
     )
     correction = apply_multiplier(residual, projection)
     return Reconstruction(
@@ -201,4 +191,23 @@ def sliding_window_reconstruction(
         correction,
         initial + correction,
         fields.harmonic_field,
+    )
+
+
+@torch.inference_mode()
+def sliding_window_residual(network, initial, mask, scale_floor, config):
+    """Blend susceptibility residuals before any full-grid spectral weighting."""
+
+    def predict(windows):
+        chi, roi = windows[:, :1], windows[:, 1:]
+        # In exterior-only windows use all voxels for scale. Null-network
+        # predictions remain unmasked before the global Fourier projection.
+        roi = torch.where(
+            roi.flatten(1).any(1)[:, None, None, None, None], roi, torch.ones_like(roi)
+        )
+        scale = masked_rms(chi, roi, scale_floor)
+        return network(chi / scale).float() * scale
+
+    return gaussian_sliding_window(
+        torch.cat((initial, mask.float()), dim=1), predict, config
     )

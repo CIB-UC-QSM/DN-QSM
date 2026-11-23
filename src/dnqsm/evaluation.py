@@ -12,8 +12,8 @@ import torch
 from scipy.io import loadmat
 from torch import Tensor
 
+from .experiment_metrics import harmonic_laplacian_mse
 from .logging import _pyplot, comparison_figure, nrmse_label, write_json
-from .losses import harmonic_laplacian_loss
 from .paths import DEFAULT_MODEL_CHECKPOINT, EVALUATION_DATA_DIR, REFERENCE_ROOT
 from .physics import (
     apply_dipole,
@@ -253,11 +253,7 @@ def evaluate_checkpoint(
     directory: Path,
     device: str = "cpu",
     *,
-    logger=None,
-    step=0,
-    epoch=0,
     bf16=True,
-    name_prefix="external",
     inference_options=None,
 ) -> dict:
     target = require_device(device)
@@ -267,12 +263,8 @@ def evaluate_checkpoint(
         cases,
         directory,
         device,
-        logger=logger,
-        step=step,
-        epoch=epoch,
         bf16=bf16,
         checkpoint=checkpoint,
-        name_prefix=name_prefix,
         inference_options=inference_options,
     )
 
@@ -284,16 +276,12 @@ def evaluate_model(
     directory: Path,
     device: str = "cpu",
     *,
-    logger=None,
-    step=0,
-    epoch=0,
     bf16=True,
     checkpoint=None,
     export_volumes=True,
-    name_prefix="external",
     inference_options=None,
 ) -> dict:
-    """Evaluate current weights and log case scalars/images at their epoch."""
+    """Evaluate a model and write case metrics, figures, and optional volumes."""
     target = require_device(device)
     inference_config = replace(model.inference_config, **(inference_options or {}))
     directory = Path(directory)
@@ -307,13 +295,9 @@ def evaluate_model(
                 case,
                 directory / case.name,
                 target,
-                logger=logger,
-                step=step,
-                epoch=epoch,
                 bf16=bf16,
                 checkpoint=checkpoint,
                 export_volumes=export_volumes,
-                name_prefix=name_prefix,
                 inference_config=inference_config,
             )
             for case in cases
@@ -330,13 +314,9 @@ def _evaluate_case(
     case_dir,
     target,
     *,
-    logger,
-    step,
-    epoch,
     bf16,
     checkpoint,
     export_volumes,
-    name_prefix,
     inference_config,
 ):
     """Limit input, prediction, and FFT tensor lifetimes to a single case."""
@@ -381,7 +361,7 @@ def _evaluate_case(
     if output.harmonic_field is not None:
         harmonic = output.harmonic_field * mask
         metrics["harmonic_laplacian_mse"] = float(
-            harmonic_laplacian_loss(harmonic, mask).mean()
+            harmonic_laplacian_mse(harmonic, mask).mean()
         )
         metrics["field_decomposition_mae"] = float(
             masked_mean((output.local_field + harmonic - phase).abs(), mask).mean()
@@ -406,16 +386,7 @@ def _evaluate_case(
         )
     figure = comparison_figure(rows, f"DN-QSM — {case.name.upper()} (physical units)")
     try:
-        if logger:
-            logger.figure(
-                figure,
-                f"{name_prefix}_{case.name}",
-                epoch,
-                epoch,
-                output_path=case_dir / "comparison.png",
-            )
-        else:
-            figure.savefig(case_dir / "comparison.png", dpi=100, bbox_inches="tight")
+        figure.savefig(case_dir / "comparison.png", dpi=100, bbox_inches="tight")
     finally:
         _pyplot().close(figure)
     # Raw padded outputs preserve Fourier projection properties. Masked NIfTI
@@ -430,7 +401,6 @@ def _evaluate_case(
             original_shape=list(case.original_shape or phase.shape[-3:]),
             crop_shape=list(case.crop_shape or phase.shape[-3:]),
             checkpoint=str(Path(checkpoint).resolve()) if checkpoint else None,
-            training_epoch=epoch,
             threshold=model.config.threshold,
             cutoff_mode=model.config.cutoff_mode,
             full_grid_field=model.config.full_grid_field,
@@ -453,75 +423,44 @@ def _evaluate_case(
             ),
         ),
     )
-    if logger:
-        logger.log(
-            name_prefix + "_" + case.name,
-            step,
-            epoch,
-            comet_step=epoch,
-            **metrics,
-        )
     return metrics
 
 
-def _export_volumes(case, case_dir, phase, mask, chi, output):
+def _export_volumes(case, case_dir, phase, mask, chi, output, *, legacy=True):
+    initial_name = "tkd" if legacy else "initial_chi"
+    volumes = {
+        "chi": output.chi,
+        initial_name: output.initial_chi,
+        "local_field": output.local_field,
+        "harmonic_field": getattr(output, "harmonic_field", None),
+        "correction": output.correction,
+    }
+    volumes = {name: value for name, value in volumes.items() if value is not None}
     arrays = dict(
         phase=case.crop_volume(phase),
         mask=case.crop_volume(mask),
         chi_reference=case.crop_volume(chi * mask),
-        chi=case.crop_volume(output.chi * mask),
-        tkd=case.crop_volume(output.tkd * mask),
-        local=case.crop_volume(output.local_field * mask),
     )
-    if output.harmonic_field is not None:
-        arrays["harmonic"] = case.crop_volume(output.harmonic_field * mask)
+    for name, value in volumes.items():
+        if legacy and name == "correction":
+            continue
+        array_name = {"local_field": "local", "harmonic_field": "harmonic"}.get(
+            name, name
+        )
+        arrays[array_name] = case.crop_volume(value * mask)
     np.savez_compressed(case_dir / "volumes.npz", **arrays)
-    atomic = dict(
-        chi=output.chi.cpu(),
-        tkd=output.tkd.cpu(),
-        correction=output.correction.cpu(),
-        local_field=output.local_field.cpu(),
-        mask=mask.cpu(),
+    volumes["mask"] = mask
+    torch.save(
+        {name: value.cpu() for name, value in volumes.items()},
+        case_dir / "padded_predictions.pt",
     )
-    if output.harmonic_field is not None:
-        atomic["harmonic_field"] = output.harmonic_field.cpu()
-    torch.save(atomic, case_dir / "padded_predictions.pt")
-    volumes = [
-        ("chi", output.chi),
-        ("tkd", output.tkd),
-        ("local_field", output.local_field),
-        ("mask", mask),
-    ]
-    if output.harmonic_field is not None:
-        volumes.append(("harmonic_field", output.harmonic_field))
-    for name, value in volumes:
+    for name, value in volumes.items():
+        if legacy and name == "correction":
+            continue
         nib.save(
             nib.Nifti1Image(case.restore_volume(value * mask), case.affine),
             case_dir / f"{name}.nii.gz",
         )
-
-
-def evaluate_training_epoch(model, cases, directory, device, logger, step, epoch, bf16):
-    """One history entry per epoch; resumed epochs replace incomplete entries."""
-    directory = Path(directory) / "evaluation"
-    summaries = evaluate_model(
-        model,
-        cases,
-        directory / "epochs" / f"epoch_{epoch:04d}",
-        device,
-        logger=logger,
-        step=step,
-        epoch=epoch,
-        bf16=bf16,
-        export_volumes=False,
-    )
-    path = directory / "history.json"
-    history = json.loads(path.read_text()) if path.is_file() else {}
-    # A rollback to an earlier checkpoint must not leave future epochs visible.
-    history = {key: value for key, value in history.items() if int(key) < epoch}
-    history[str(epoch)] = summaries
-    write_json(path, history)
-    return summaries
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -8,19 +7,12 @@ import torch
 import torch.nn.functional as F
 
 from dnqsm.model import DNQSM, ModelConfig
-from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import (
     frequency_laplacian,
     masked_rms,
     smooth_harmonic_extension,
 )
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import (
-    TrainConfig,
-    checkpoint_training_config,
-    model_config,
-    parse_args,
-)
 
 
 def centered_reference(field, mask, num_iters=6):
@@ -197,36 +189,8 @@ class HarmonicExtensionTests(unittest.TestCase):
                             atol=0,
                         )
 
-    def test_configuration_defaults_cli_and_resume_preserve_policy(self):
+    def test_extension_defaults_and_invalid_inputs(self):
         self.assertEqual(ModelConfig().laplacian_extension_iters, 6)
-        self.assertEqual(OverfitConfig().laplacian_extension_iters, 6)
-        self.assertEqual(
-            model_config(
-                parse_args([], use_default_profile=True)
-            ).laplacian_extension_iters,
-            6,
-        )
-        self.assertEqual(checkpoint_training_config({})["laplacian_extension_iters"], 0)
-        self.assertEqual(
-            parse_args(["--laplacian-extension-iters", "9"]).laplacian_extension_iters,
-            9,
-        )
-        with tempfile.TemporaryDirectory() as temp:
-            profile = Path(temp) / "legacy.json"
-            profile.write_text(json.dumps({"laplacian_operator": "frequency"}))
-            self.assertEqual(
-                parse_args(["--config", str(profile)]).laplacian_extension_iters, 0
-            )
-            for iterations in (0, 6):
-                config = asdict(TrainConfig(laplacian_extension_iters=iterations))
-                if not iterations:
-                    config.pop("laplacian_extension_iters")
-                path = Path(temp) / "training.pt"
-                torch.save(dict(config=config), path)
-                self.assertEqual(
-                    parse_args(["--resume", str(path)]).laplacian_extension_iters,
-                    iterations,
-                )
         for invalid in (-1, 1.5, True):
             with self.assertRaisesRegex(ValueError, "Extension iterations"):
                 replace(ModelConfig(), laplacian_extension_iters=invalid)

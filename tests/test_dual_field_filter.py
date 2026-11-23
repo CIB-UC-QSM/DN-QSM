@@ -2,7 +2,7 @@
 
 import tempfile
 import unittest
-from dataclasses import asdict, replace
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
@@ -12,17 +12,9 @@ import torch.nn.functional as F
 from scipy.ndimage import binary_erosion
 
 from dnqsm.evaluation import EvaluationCase, evaluate_model
-from dnqsm.losses import (
-    LossNormalization,
-    LossWeights,
-    harmonic_field_loss_terms,
-    harmonic_laplacian_loss,
-    normalize_loss_terms,
-    reconstruction_loss,
-)
+from dnqsm.experiment_metrics import harmonic_laplacian_mse
 from dnqsm.model import DNQSM, DualFieldUNet3D
 from dnqsm.model import ModelConfig as DefaultModelConfig
-from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import (
     dipole_tensor,
     laplacian_stencil,
@@ -31,13 +23,6 @@ from dnqsm.physics import (
     spherical_erosion,
 )
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import (
-    _predict_training_batch,
-    checkpoint_training_config,
-    model_config,
-    parse_args,
-    set_training_branch,
-)
 from tests.helpers import dual_field_model_config as ModelConfig
 from tests.helpers import laplacian_model_config
 
@@ -119,73 +104,6 @@ class DualFieldFilterTests(unittest.TestCase):
             )
         self.assertFalse(torch.equal(before.harmonic_field, after.harmonic_field))
 
-    def test_filter_only_and_joint_losses_train_both_decoders_and_shared_encoder(self):
-        field, mask = self.fields()
-        data = dict(
-            phase=field,
-            mask=mask,
-            local=field * mask * 0.4,
-            chi=field * mask,
-            local_full=field * 0.4,
-            dipole=dipole_tensor(field.shape[-3:]),
-        )
-        for filtering_only in (True, False):
-            model = DNQSM(ModelConfig((2, 4), checkpoint_blocks=True))
-            set_training_branch(model, "phase" if filtering_only else "joint")
-            with patch.object(
-                model.null_network, "forward", wraps=model.null_network.forward
-            ) as null:
-                _, raw, _ = _predict_training_batch(
-                    model, data, torch.device("cpu"), False, filtering_only, False
-                )
-            self.assertEqual(null.call_count, 0 if filtering_only else 1)
-            self.assertIn("harmonic_laplacian", raw)
-            self.assertIn("field_decomposition", raw)
-            shared, local_only, harmonic_only = torch.autograd.grad(
-                raw["harmonic_laplacian"].sum(),
-                [
-                    model.filter.downs[0][0].weight,
-                    model.filter.local_decoder.final.weight,
-                    model.filter.harmonic_decoder.final.weight,
-                ],
-                retain_graph=True,
-                allow_unused=True,
-            )
-            self.assertIsNone(local_only)
-            self.assertGreater(float(shared.abs().sum()), 0)
-            self.assertGreater(float(harmonic_only.abs().sum()), 0)
-            weights = LossWeights(
-                extension=0, harmonic_laplacian=100, field_decomposition=1
-            )
-            sum(
-                getattr(weights, name) * term.mean() for name, term in raw.items()
-            ).backward()
-            for parameter in (
-                model.filter.downs[0][0].weight,
-                model.filter.bottleneck[0].weight,
-                model.filter.local_decoder.final.weight,
-                model.filter.harmonic_decoder.final.weight,
-            ):
-                self.assertTrue(bool(parameter.grad.isfinite().all()))
-                self.assertGreater(float(parameter.grad.abs().sum()), 0)
-            set_training_branch(model, "chi")
-            self.assertTrue(all(not p.requires_grad for p in model.filter.parameters()))
-            self.assertTrue(
-                all(p.requires_grad for p in model.null_network.parameters())
-            )
-            _, without, _ = _predict_training_batch(
-                model,
-                data,
-                torch.device("cpu"),
-                False,
-                False,
-                False,
-                include_harmonic=False,
-                include_decomposition=False,
-            )
-            self.assertNotIn("harmonic_laplacian", without)
-            self.assertNotIn("field_decomposition", without)
-
     def test_new_checkpoints_roundtrip_and_legacy_models_still_load(self):
         field, mask = self.fields()
         with tempfile.TemporaryDirectory() as temp:
@@ -219,27 +137,11 @@ class DualFieldFilterTests(unittest.TestCase):
         torch.testing.assert_close(a.local_field, b.local_field, rtol=0, atol=0)
         torch.testing.assert_close(a.harmonic_field, b.harmonic_field, rtol=0, atol=0)
 
-    def test_defaults_cli_weights_and_architecture_guards(self):
-        for config in (
-            DefaultModelConfig(),
-            model_config(parse_args([])),
-            OverfitConfig(),
-        ):
-            self.assertTrue(config.laplacian_input)
-            self.assertEqual(config.filter_input_version, 2)
-            self.assertEqual(config.conditional_laplacian_threshold, 32)
-        config = parse_args(
-            [
-                "--lambda-harmonic-laplacian",
-                "0.2",
-                "--lambda-field-decomposition",
-                "0.5",
-            ]
-        )
-        self.assertEqual(config.lambda_harmonic_laplacian, 0.2)
-        self.assertEqual(config.lambda_field_decomposition, 0.5)
-        for key in ("lambda_harmonic_laplacian", "lambda_field_decomposition"):
-            self.assertEqual(checkpoint_training_config({})[key], 0)
+    def test_default_filter_architecture_and_dual_field_guards(self):
+        config = DefaultModelConfig()
+        self.assertTrue(config.laplacian_input)
+        self.assertEqual(config.filter_input_version, 2)
+        self.assertEqual(config.conditional_laplacian_threshold, 32)
         for options in (
             dict(laplacian_input=True),
             dict(residual_filter=True),
@@ -272,7 +174,7 @@ class DualFieldFilterTests(unittest.TestCase):
             )
 
 
-class HarmonicLossTests(unittest.TestCase):
+class HarmonicMetricTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
@@ -306,22 +208,22 @@ class HarmonicLossTests(unittest.TestCase):
             spherical_erosion(mask.float()), expected, rtol=0, atol=0
         )
 
-    def test_empty_eroded_samples_have_zero_loss_and_finite_zero_gradients(self):
+    def test_empty_eroded_samples_have_zero_mse_and_finite_zero_gradients(self):
         harmonic = torch.randn(2, 1, 11, 11, 11, requires_grad=True)
         mask = torch.zeros_like(harmonic)
         mask[0, 0, 4:7, 4:7, 4:7] = 1
         mask[1] = 1
-        loss = harmonic_laplacian_loss(harmonic, mask)
-        self.assertEqual(float(loss[0].detach()), 0)
-        self.assertGreater(float(loss[1].detach()), 0)
-        self.assertTrue(bool(loss.isfinite().all()))
-        loss.sum().backward()
+        mse = harmonic_laplacian_mse(harmonic, mask)
+        self.assertEqual(float(mse[0].detach()), 0)
+        self.assertGreater(float(mse[1].detach()), 0)
+        self.assertTrue(bool(mse.isfinite().all()))
+        mse.sum().backward()
         torch.testing.assert_close(
             harmonic.grad[0], torch.zeros_like(harmonic.grad[0]), rtol=0, atol=0
         )
         self.assertGreater(float(harmonic.grad[1].abs().sum()), 0)
         tiny = torch.ones(1, 1, 1, 1, 1, requires_grad=True)
-        zero = harmonic_laplacian_loss(tiny, torch.ones_like(tiny))
+        zero = harmonic_laplacian_mse(tiny, torch.ones_like(tiny))
         zero.sum().backward()
         self.assertEqual(float(zero.detach()), 0)
         self.assertEqual(float(tiny.grad.abs().sum()), 0)
@@ -332,101 +234,16 @@ class HarmonicLossTests(unittest.TestCase):
         harmonic = torch.randn(2, 1, 13, 14, 15, requires_grad=True)
         mask = torch.zeros_like(harmonic)
         mask[..., 1:-1, 1:-1, 1:-1] = 1
-        local = torch.randn_like(harmonic, requires_grad=True)
-        total = torch.randn_like(harmonic, requires_grad=True)
         with torch.autocast("cpu", dtype=torch.bfloat16):
-            terms = harmonic_field_loss_terms(local, harmonic, mask, total_field=total)
-        self.assertEqual(terms["harmonic_laplacian"].dtype, torch.float32)
+            mse = harmonic_laplacian_mse(harmonic, mask)
+        self.assertEqual(mse.dtype, torch.float32)
         expected = masked_mean(
             F.conv3d(harmonic * mask, laplacian_stencil(), padding=1).square(),
             spherical_erosion(mask),
         )
-        torch.testing.assert_close(
-            terms["harmonic_laplacian"], expected, rtol=0, atol=0
-        )
-        changed = harmonic_field_loss_terms(
-            local, harmonic + (1 - mask) * 1000, mask, total_field=total
-        )
-        for name in terms:
-            torch.testing.assert_close(terms[name], changed[name], rtol=0, atol=0)
-        sum(term.mean() for term in terms.values()).backward()
-        self.assertIsNone(total.grad)
+        torch.testing.assert_close(mse, expected, rtol=0, atol=0)
+        changed = harmonic_laplacian_mse(harmonic + (1 - mask) * 1000, mask)
+        torch.testing.assert_close(mse, changed, rtol=0, atol=0)
+        mse.mean().backward()
         self.assertEqual(float(harmonic.grad[mask == 0].abs().sum()), 0)
         self.assertGreater(float(harmonic.grad.abs().sum()), 0)
-        self.assertGreater(float(local.grad.abs().sum()), 0)
-
-    def test_field_sum_penalty_removes_the_zero_harmonic_shortcut(self):
-        mask = torch.zeros(1, 1, 13, 13, 13)
-        mask[..., 1:-1, 1:-1, 1:-1] = 1
-        local = mask * 0.01
-        total = local + mask * 0.2
-        zero = harmonic_field_loss_terms(
-            local, torch.zeros_like(mask), mask, total_field=total
-        )
-        matched = harmonic_field_loss_terms(
-            local, total - local, mask, total_field=total
-        )
-        self.assertEqual(float(zero["harmonic_laplacian"]), 0)
-        self.assertGreater(float(zero["field_decomposition"]), 0)
-        self.assertEqual(float(matched["field_decomposition"]), 0)
-        self.assertTrue(bool(spherical_erosion(mask).any()))
-        # The original mask creates edge responses, but the eroded loss excludes them.
-        boundary_response = F.conv3d(
-            (total - local) * mask, laplacian_stencil(), padding=1
-        )
-        self.assertGreater(float(masked_mean(boundary_response.square(), mask)), 0)
-        torch.testing.assert_close(
-            matched["harmonic_laplacian"],
-            torch.zeros_like(matched["harmonic_laplacian"]),
-            atol=1e-12,
-            rtol=0,
-        )
-        with self.assertRaisesRegex(ValueError, "aligned total field"):
-            harmonic_field_loss_terms(local, total - local, mask)
-
-    def test_per_sample_normalization_is_amplitude_invariant_and_detached(self):
-        local = torch.randn(2, 1, 11, 12, 13, requires_grad=True)
-        harmonic = torch.randn_like(local, requires_grad=True)
-        total = torch.randn_like(local, requires_grad=True)
-        target = torch.randn_like(local, requires_grad=True)
-        mask = torch.ones_like(local)
-        terms = harmonic_field_loss_terms(local, harmonic, mask, total_field=total)
-        normalized = normalize_loss_terms(
-            terms, target, target, mask, LossNormalization()
-        )
-        factors = torch.tensor([0.2, 12.0]).reshape(2, 1, 1, 1, 1)
-        scaled = harmonic_field_loss_terms(
-            local * factors, harmonic * factors, mask, total_field=total * factors
-        )
-        scaled = normalize_loss_terms(
-            scaled, target * factors, target * factors, mask, LossNormalization()
-        )
-        for name in normalized:
-            torch.testing.assert_close(normalized[name], scaled[name])
-        sum(term.mean() for term in normalized.values()).backward()
-        self.assertIsNone(total.grad)
-        self.assertIsNone(target.grad)
-
-    def test_zero_weights_skip_both_new_terms_and_laplacian_computation(self):
-        model = DNQSM(ModelConfig((2, 4)))
-        field = torch.randn(1, 1, 8, 8, 8) * 0.01
-        mask = torch.ones_like(field)
-        dipole = dipole_tensor(field.shape[-3:])
-        prediction = model(field, mask, dipole)
-        weights = replace(LossWeights(), harmonic_laplacian=0, field_decomposition=0)
-        with patch(
-            "dnqsm.losses.spatial_laplacian", side_effect=AssertionError("disabled")
-        ):
-            loss, terms = reconstruction_loss(
-                prediction, field, field, mask, dipole, weights
-            )
-        self.assertNotIn("harmonic_laplacian", terms)
-        self.assertNotIn("field_decomposition", terms)
-        self.assertTrue(bool(loss.isfinite()))
-        for name in ("harmonic_laplacian", "field_decomposition"):
-            with self.assertRaises(ValueError):
-                replace(weights, **{name: -1})
-
-
-if __name__ == "__main__":
-    unittest.main()

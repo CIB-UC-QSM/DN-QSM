@@ -9,9 +9,7 @@ import torch
 from torch import nn
 
 from dnqsm.model import DNQSM, ModelConfig, UNet3D
-from dnqsm.overfit import OverfitConfig
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, model_config, parse_args
 
 
 class ActivationTests(unittest.TestCase):
@@ -70,10 +68,6 @@ class ActivationTests(unittest.TestCase):
             torch.testing.assert_close(y, torch.tensor([-0.6, 0.5]))
             y.sum().backward()
             torch.testing.assert_close(x.grad, torch.tensor([0.3, 1.0]))
-        self.assertEqual(
-            model_config(parse_args(["--leaky-relu-slope", "0.3"])).leaky_relu_slope,
-            0.3,
-        )
         field = torch.randn(1, 1, 9, 11, 13)
         mask = torch.ones_like(field)
         with tempfile.TemporaryDirectory() as temporary:
@@ -95,7 +89,6 @@ class ActivationTests(unittest.TestCase):
                     rtol=0,
                     atol=0,
                 )
-        self.assertEqual(checkpoint_training_config({})["leaky_relu_slope"], 0.01)
         for slope in (-0.1, float("inf"), float("nan")):
             with self.assertRaisesRegex(ValueError, "slope"):
                 ModelConfig(leaky_relu_slope=slope)
@@ -109,12 +102,14 @@ class ActivationTests(unittest.TestCase):
                 config = asdict(model.config)
                 if activation == "celu":
                     config.pop("activation")
+                    config.pop("leaky_relu_slope")
                 path = Path(temporary) / f"{activation}.pt"
                 torch.save(
                     dict(version=1, model_config=config, model=model.state_dict()), path
                 )
                 loaded = load_trained_model(path)
                 self.assertEqual(loaded.config.activation, activation)
+                self.assertEqual(loaded.config.leaky_relu_slope, 0.01)
                 with torch.no_grad():
                     torch.testing.assert_close(
                         loaded.predict_local_field(field, mask),
@@ -134,17 +129,7 @@ class ActivationTests(unittest.TestCase):
                     adapted.state_dict()[name], tensor, rtol=0, atol=0
                 )
 
-    def test_training_profiles_and_historical_resume_metadata(self):
-        self.assertEqual(OverfitConfig().activation, "leaky_relu")
-        configs = [parse_args([])] + [
-            parse_args(["--config", str(path)])
-            for path in sorted(
-                (Path(__file__).resolve().parents[1] / "configs").glob("*.json")
-            )
-        ]
-        for config in configs:
-            self.assertEqual(model_config(config).activation, "leaky_relu")
-        self.assertEqual(checkpoint_training_config({})["activation"], "celu")
+    def test_invalid_activation_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "Activation"):
             ModelConfig(activation="invalid")
 

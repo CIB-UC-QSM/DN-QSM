@@ -10,9 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-dnqsm-train = "dnqsm.training:main"
 dnqsm-evaluate = "dnqsm.evaluation:main"
-dnqsm-overfit-cosmos = "dnqsm.overfit:main"
 
 [build-system]
 requires = ["setuptools>=75"]

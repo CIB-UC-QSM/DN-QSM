@@ -1,10 +1,33 @@
-"""Descriptive paired-study metrics, with full-grid Fourier band accounting."""
+"""Reconstruction metrics and paired summaries across subjects."""
 
 import numpy as np
 import torch
 from scipy.ndimage import gaussian_laplace
+from torch import Tensor
 
-from .physics import SPATIAL, masked_mean, masked_nrmse, rfft_kernel
+from .physics import (
+    SPATIAL,
+    masked_mean,
+    masked_nrmse,
+    rfft_kernel,
+    spatial_laplacian,
+    spherical_erosion,
+    validate_mask,
+)
+
+
+def harmonic_laplacian_mse(harmonic_field: Tensor, mask: Tensor) -> Tensor:
+    """Per-sample Delta(mask*h) MSE inside a radius-3 spherical erosion of mask.
+
+    Mask before differentiating with the original ROI, then select the eroded
+    ROI for the reduction; remasking with the eroded ROI would create new edges.
+    Empty eroded samples contribute a finite, differentiable zero.
+    """
+    validate_mask(mask, harmonic_field)
+    interior = spherical_erosion(mask, radius=3)
+    with torch.autocast(harmonic_field.device.type, enabled=False):
+        laplacian = spatial_laplacian(harmonic_field.float() * mask.float())
+        return masked_mean(laplacian.square(), interior)
 
 
 @torch.no_grad()
@@ -19,11 +42,14 @@ def reconstruction_metrics(
     variance = masked_mean(target.square(), mask) - mean_target.square()
     covariance = masked_mean(target * predicted, mask) - mean_target * mean_predicted
     slope = covariance / variance.clamp_min(1e-20)
+    initial = output.initial_chi
     values = {
         "chi_nrmse": masked_nrmse(predicted, target, mask),
-        "tkd_nrmse": masked_nrmse(output.tkd, target, mask),
+        "tkd_nrmse": masked_nrmse(initial, target, mask)
+        if initial is not None
+        else [None] * len(chi),
         "local_nrmse": masked_nrmse(output.local_field, local, mask)
-        if local is not None
+        if local is not None and output.local_field is not None
         else [None] * len(chi),
         "bias_ppm": masked_mean(error, mask).flatten().tolist(),
         "slope": slope.flatten().tolist(),

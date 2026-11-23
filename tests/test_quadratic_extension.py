@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from dataclasses import asdict, replace
@@ -15,12 +14,6 @@ from dnqsm.physics import (
     smooth_harmonic_extension,
 )
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import (
-    TrainConfig,
-    checkpoint_training_config,
-    model_config,
-    parse_args,
-)
 
 
 def boundary_laplacian(field, mask):
@@ -205,27 +198,6 @@ class QuadraticExtensionTests(unittest.TestCase):
                     torch.testing.assert_close(
                         target.state_dict()[name], value, rtol=0, atol=0
                     )
-            old = asdict(TrainConfig(laplacian_extension_mode="harmonic"))
-            old.pop("laplacian_extension_mode")
-            profile = Path(temp) / "old.json"
-            profile.write_text(json.dumps(old))
-            self.assertEqual(
-                parse_args(["--config", str(profile)]).laplacian_extension_mode,
-                "harmonic",
-            )
-            path = Path(temp) / "old_training.pt"
-            torch.save(dict(config=old), path)
-            self.assertEqual(
-                parse_args(["--resume", str(path)]).laplacian_extension_mode, "harmonic"
-            )
-        self.assertEqual(
-            checkpoint_training_config({})["laplacian_extension_mode"], "harmonic"
-        )
-        self.assertEqual(
-            model_config(
-                parse_args([], use_default_profile=True)
-            ).laplacian_extension_mode,
-            "quadratic",
-        )
+        self.assertEqual(ModelConfig().laplacian_extension_mode, "quadratic")
         with self.assertRaisesRegex(ValueError, "extension mode"):
             replace(ModelConfig(), laplacian_extension_mode="invalid")

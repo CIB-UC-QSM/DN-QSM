@@ -9,10 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from dnqsm.model import DNQSM
-from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, model_config, parse_args
 from tests.helpers import laplacian_model_config
 
 
@@ -86,7 +84,7 @@ class ConditionalScalingTests(unittest.TestCase):
                 atol=0,
             )
 
-    def test_checkpoint_cli_and_legacy_defaults(self):
+    def test_checkpoint_and_legacy_defaults(self):
         field = torch.randn(1, 1, 12, 12, 12) * 0.01 + 1
         mask = torch.ones_like(field)
         with tempfile.TemporaryDirectory() as temporary:
@@ -114,33 +112,6 @@ class ConditionalScalingTests(unittest.TestCase):
                         rtol=0,
                         atol=0,
                     )
-        self.assertEqual(
-            model_config(
-                parse_args(
-                    [
-                        "--filter-input-version",
-                        "2",
-                        "--laplacian-input",
-                        "--conditional-laplacian-threshold",
-                        "32",
-                    ]
-                )
-            ).conditional_laplacian_threshold,
-            32,
-        )
-        self.assertEqual(
-            checkpoint_training_config({})["conditional_laplacian_threshold"], 0
-        )
-        self.assertEqual(
-            model_config(parse_args([])).conditional_laplacian_threshold, 32
-        )
-        self.assertEqual(OverfitConfig().conditional_laplacian_threshold, 32)
-        self.assertEqual(
-            model_config(
-                parse_args(["--conditional-laplacian-threshold", "0"])
-            ).conditional_laplacian_threshold,
-            0,
-        )
         for value in (-1, float("inf"), float("nan")):
             with self.assertRaises(ValueError):
                 laplacian_model_config(conditional_laplacian_threshold=value)

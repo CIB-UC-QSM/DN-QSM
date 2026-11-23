@@ -8,11 +8,9 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from dnqsm.model import DNQSM
-from dnqsm.overfit import OverfitConfig
+from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, model_config, parse_args
 from tests.helpers import laplacian_model_config
 
 
@@ -93,12 +91,10 @@ class FilterLaplacianResidualTests(unittest.TestCase):
         )
 
     def test_defaults_checkpoint_roundtrip_and_architecture_guards(self):
-        for config in (model_config(parse_args([])), OverfitConfig()):
-            self.assertFalse(config.filter_laplacian_residual)
-            self.assertTrue(config.filter_output_skip)
-            self.assertEqual(config.filter_refinement_features, 0)
-        self.assertEqual(OverfitConfig().lambda_physics, 1)
-        self.assertFalse(checkpoint_training_config({})["filter_laplacian_residual"])
+        config = ModelConfig()
+        self.assertFalse(config.filter_laplacian_residual)
+        self.assertTrue(config.filter_output_skip)
+        self.assertEqual(config.filter_refinement_features, 0)
         model = DNQSM(self.config()).eval()
         field = torch.randn(1, 1, 9, 11, 13)
         mask = torch.ones_like(field)

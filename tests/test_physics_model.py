@@ -4,15 +4,13 @@ import unittest
 import numpy as np
 import torch
 
-from dnqsm.losses import LossWeights, reconstruction_loss
-from dnqsm.model import DNQSM, ModelConfig, Reconstruction
+from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import (
     apply_dipole,
     apply_multiplier,
     continuous_dipole_kernel,
     cutoff_kernels,
     dipole_tensor,
-    masked_mean,
     masked_nrmse,
 )
 
@@ -111,81 +109,6 @@ class PhysicsAndModelTests(unittest.TestCase):
         # Deliberately leave the result unmasked to preserve this property.
         self.assertGreater(float(result.correction.detach()[mask == 0].abs().sum()), 0)
 
-    def test_loss_has_no_predicted_field_consistency_penalty(self):
-        shape = (8, 8, 8)
-        chi = (torch.randn(1, 1, *shape) * 0.01).requires_grad_()
-        local = torch.full_like(chi, 0.02, requires_grad=True)
-        mask = torch.zeros_like(chi)
-        mask[..., 1:-1, 1:-1, 1:-1] = 1
-        dipole = dipole_tensor(shape)
-        prediction = Reconstruction(local, chi, chi * 0, chi)
-        local_gt, chi_gt = torch.zeros_like(chi), torch.ones_like(chi) * 0.01
-        weights = LossWeights(local=3, chi=4, physics=2, extension=0)
-        loss, terms = reconstruction_loss(
-            prediction, local_gt, chi_gt, mask, dipole, weights, normalization=None
-        )
-        self.assertEqual(set(terms), {"physics", "local", "local_gradient", "chi"})
-        torch.testing.assert_close(
-            loss,
-            sum(getattr(weights, name) * value for name, value in terms.items()),
-        )
-        loss.backward()
-        # With chi independent here, the only local-field gradient is ROI L1.
-        # No consistency gradient from A(chi) to the predicted local field remains.
-        torch.testing.assert_close(local.grad, weights.local * mask / mask.sum())
-        self.assertGreater(float(local.grad.abs().sum()), 0)
-        self.assertGreater(float(chi.grad.abs().sum()), 0)
-        self.assertTrue(bool((local.grad[mask == 0] == 0).all()))
-
-    def test_disabled_physics_objective_excludes_physics_gradients(self):
-        shape = (8, 10, 12)
-        chi = torch.linspace(0.01, 0.03, steps=8 * 10 * 12).reshape(1, 1, *shape)
-        chi.requires_grad_()
-        local = torch.full_like(chi, 0.03, requires_grad=True)
-        mask = torch.zeros_like(chi)
-        mask[..., 1:-1, 1:-1, 1:-1] = 1
-        dipole = dipole_tensor(shape)
-        prediction = Reconstruction(local, chi, chi * 0, chi)
-        clean = torch.zeros_like(chi)
-        loss, terms = reconstruction_loss(
-            prediction,
-            clean,
-            clean,
-            mask,
-            dipole,
-            weights=LossWeights(physics=0, extension=0),
-            normalization=None,
-        )
-        torch.testing.assert_close(
-            loss, 1.5 * terms["local"] + terms["local_gradient"] + terms["chi"]
-        )
-        self.assertGreater(float(terms["physics"].detach()), 0)
-        loss.backward()
-        torch.testing.assert_close(local.grad, 1.5 * mask / mask.sum())
-        torch.testing.assert_close(chi.grad, mask / mask.sum())
-
-    def test_clean_field_physics_penalizes_jointly_biased_predictions(self):
-        shape = (8, 10, 12)
-        dipole = dipole_tensor(shape)
-        chi = (torch.randn(1, 1, *shape) * 0.02).requires_grad_()
-        mask = torch.ones_like(chi)
-        clean = torch.zeros_like(chi)
-        # A self-consistent but wrong filter/susceptibility pair has zero old
-        # consistency penalty, while clean-field physics still gives gradients.
-        local = apply_dipole(chi.detach(), dipole).requires_grad_()
-        prediction = Reconstruction(local, chi, chi * 0, chi)
-        _, terms = reconstruction_loss(
-            prediction, clean, clean, mask, dipole, normalization=None
-        )
-        self.assertNotIn("forward", terms)
-        torch.testing.assert_close(
-            terms["physics"],
-            masked_mean(apply_dipole(chi, dipole).square(), mask).mean(),
-        )
-        terms["physics"].backward()
-        self.assertGreater(float(chi.grad.abs().sum()), 0)
-        self.assertIsNone(local.grad)
-
     def test_checkpointed_gradients_match_and_both_networks_train(self):
         model = DNQSM(ModelConfig((2, 4), checkpoint_blocks=False))
         checkpointed = copy.deepcopy(model)
@@ -198,10 +121,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         gradients = []
         for net in (model, checkpointed):
             result = net(phase, mask, dipole)
-            loss, _ = reconstruction_loss(
-                result, phase * 0.5, phase, mask, dipole, input_field=phase
-            )
-            loss.backward()
+            result.chi.square().mean().backward()
             for branch in (net.filter, net.null_network):
                 self.assertGreater(
                     sum(float(p.grad.abs().sum()) for p in branch.parameters()), 0
@@ -215,8 +135,7 @@ class PhysicsAndModelTests(unittest.TestCase):
         mask = torch.ones_like(phase)
         d = dipole_tensor(phase.shape[-3:])
         output = model(phase, mask, d)
-        loss, _ = reconstruction_loss(output, phase, phase, mask, d, input_field=phase)
-        loss.backward()
+        output.chi.square().mean().backward()
         self.assertTrue(
             all(
                 p.grad is not None and bool(p.grad.isfinite().all())

@@ -10,7 +10,6 @@ from torch import nn
 from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import dipole_tensor
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, parse_args
 
 
 class StridedNoBiasTests(unittest.TestCase):
@@ -116,18 +115,10 @@ class StridedNoBiasTests(unittest.TestCase):
                     bool(list(loaded.filter.downsamples[0].parameters())), not legacy
                 )
 
-    def test_active_profile_and_legacy_resume_defaults_are_explicit(self):
-        config = parse_args([], use_default_profile=True)
+    def test_default_downsampling_and_bias_validation(self):
+        config = ModelConfig()
         self.assertEqual(config.downsampling, "strided_conv")
         self.assertFalse(config.bias)
-        self.assertIsNone(config.init_checkpoint)
-        self.assertEqual(config.patch_size, 0)
-        baseline = parse_args(["--config", "configs/full_volume_best.json"])
-        self.assertEqual(baseline.downsampling, "max_pool")
-        self.assertTrue(baseline.bias)
-        legacy = checkpoint_training_config({})
-        self.assertEqual(legacy["downsampling"], "max_pool")
-        self.assertTrue(legacy["bias"])
         with self.assertRaisesRegex(ValueError, "Downsampling"):
             replace(self.config(), downsampling="invalid")
         with self.assertRaisesRegex(ValueError, "boolean"):

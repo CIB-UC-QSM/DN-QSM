@@ -5,18 +5,9 @@ from pathlib import Path
 
 import torch
 
-from dnqsm.losses import LOSS_VERSION, local_tkd_loss
 from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import apply_multiplier, cutoff_kernels, dipole_tensor, masked_rms
 from dnqsm.runtime import atomic_save, load_trained_model
-from dnqsm.training import (
-    TrainConfig,
-    _predict_training_batch,
-    checkpoint_training_config,
-    model_config,
-    parse_args,
-    run_training,
-)
 
 
 class SoftCutoffTests(unittest.TestCase):
@@ -103,40 +94,6 @@ class SoftCutoffTests(unittest.TestCase):
         torch.testing.assert_close(output.chi, output.tkd + output.correction)
         self.assertGreater(float(weight.min()), 0)
 
-    def test_filtering_only_and_joint_losses_share_soft_inverse(self):
-        torch.manual_seed(17)
-        model = DNQSM(ModelConfig((2, 4)))
-        field, mask, dipole = self.inputs()
-        chi = torch.zeros_like(field)
-        data = dict(
-            phase=field,
-            mask=mask,
-            dipole=dipole,
-            local=field,
-            local_full=field,
-            chi=chi,
-        )
-        local, raw, _ = _predict_training_batch(
-            model, data, torch.device("cpu"), False, True, False, include_tkd=True
-        )
-        expected = local_tkd_loss(local, chi, mask, dipole, 0.1, "soft")
-        torch.testing.assert_close(raw["local_tkd"], expected)
-        self.assertGreater(
-            float(
-                (expected - local_tkd_loss(local, chi, mask, dipole, 0.1, "hard"))
-                .abs()
-                .max()
-            ),
-            1e-6,
-        )
-        output, raw, _ = _predict_training_batch(
-            model, data, torch.device("cpu"), False, False, False, include_tkd=True
-        )
-        torch.testing.assert_close(
-            raw["local_tkd"],
-            local_tkd_loss(output.local_field, chi, mask, dipole, 0.1, "soft"),
-        )
-
     def test_checkpoint_roundtrip_and_historical_hard_fallback(self):
         field, mask, dipole = self.inputs()
         with tempfile.TemporaryDirectory() as temp:
@@ -158,38 +115,11 @@ class SoftCutoffTests(unittest.TestCase):
                     atol=0,
                 )
 
-    def test_new_defaults_historical_profiles_warmstart_and_resume_guard(self):
-        active = parse_args([], use_default_profile=True)
-        self.assertEqual((active.cutoff_mode, active.threshold), ("soft", 0.1))
-        self.assertEqual(model_config(active).cutoff_mode, "soft")
-        historical = parse_args(["--config", "configs/fullgrid_100epochs.json"])
-        self.assertEqual(historical.cutoff_mode, "hard")
-        self.assertEqual(checkpoint_training_config({})["cutoff_mode"], "hard")
+    def test_default_cutoff_and_initialization_from_hard_cutoff(self):
+        config = ModelConfig()
+        self.assertEqual((config.cutoff_mode, config.threshold), ("soft", 0.1))
         source = DNQSM(ModelConfig((2, 4), cutoff_mode="hard", threshold=0.05))
         target = DNQSM(replace(source.config, cutoff_mode="soft", threshold=0.1))
         target.initialize_from(source)
         for name, value in source.state_dict().items():
             torch.testing.assert_close(target.state_dict()[name], value, rtol=0, atol=0)
-        with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / "resume.pt"
-            saved_config = asdict(
-                TrainConfig(
-                    device="cpu",
-                    features=(2, 4),
-                    cutoff_mode="hard",
-                    threshold=0.05,
-                    threads=2,
-                )
-            )
-            saved_config.pop("cutoff_mode")
-            atomic_save(
-                dict(version=1, loss_version=LOSS_VERSION, config=saved_config), path
-            )
-            resumed = parse_args(["--resume", str(path)])
-            self.assertEqual((resumed.cutoff_mode, resumed.threshold), ("hard", 0.05))
-            with self.assertRaisesRegex(ValueError, "cutoff_mode"):
-                run_training(replace(resumed, cutoff_mode="soft"))
-
-
-if __name__ == "__main__":
-    unittest.main()

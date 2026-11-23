@@ -9,7 +9,6 @@ import torch
 
 from dnqsm.model import DNQSM
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, model_config, parse_args
 from tests.helpers import laplacian_model_config
 
 
@@ -66,7 +65,7 @@ class LaplacianPrecisionTests(unittest.TestCase):
                 float(feature[..., 2:-2, 2:-2, 2:-2].float().mean()), -0.0078125
             )
 
-    def test_new_checkpoint_and_training_precision_roundtrip(self):
+    def test_new_checkpoint_precision_roundtrip(self):
         model = DNQSM(laplacian_model_config((2, 4)))
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "new.pt"
@@ -79,22 +78,3 @@ class LaplacianPrecisionTests(unittest.TestCase):
                 path,
             )
             self.assertTrue(load_trained_model(path).config.laplacian_fp32)
-        self.assertTrue(model_config(parse_args([])).laplacian_fp32)
-        self.assertFalse(
-            model_config(
-                parse_args(
-                    [
-                        "--no-laplacian-fp32",
-                        "--conditional-laplacian-threshold",
-                        "0",
-                        "--laplacian-operator",
-                        "stencil",
-                    ]
-                )
-            ).laplacian_fp32
-        )
-        self.assertFalse(checkpoint_training_config({})["laplacian_fp32"])
-
-
-if __name__ == "__main__":
-    unittest.main()

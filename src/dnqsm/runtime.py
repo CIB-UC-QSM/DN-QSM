@@ -21,9 +21,7 @@ def autocast_context(device: torch.device, enabled: bool = True):
 def require_device(name: str | torch.device) -> torch.device:
     device = torch.device(name)
     if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            "CUDA is unavailable. Restore GPU access for full training; use --device cpu only for explicit CPU runs."
-        )
+        raise RuntimeError("CUDA is unavailable. Use --device cpu to run on the CPU.")
     if device.type not in ("cpu", "cuda"):
         raise ValueError("Supported devices are cpu and cuda")
     return device

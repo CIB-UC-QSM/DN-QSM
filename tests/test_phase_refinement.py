@@ -8,15 +8,8 @@ from pathlib import Path
 import torch
 
 from dnqsm.model import DNQSM, PhaseRefinementBlock
-from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import (
-    checkpoint_training_config,
-    model_config,
-    parse_args,
-    set_training_branch,
-)
 from tests.helpers import laplacian_model_config
 
 
@@ -113,16 +106,6 @@ class PhaseRefinementTests(unittest.TestCase):
             self.assertTrue(bool(torch.isfinite(parameter.grad).all()))
             self.assertGreater(float(parameter.grad.abs().sum()), 0)
         self.assertEqual(float(field.grad[mask == 0].abs().sum()), 0)
-        set_training_branch(model, "chi")
-        self.assertFalse(model.filter.refinement.training)
-        self.assertTrue(
-            all(not p.requires_grad for p in model.filter.refinement.parameters())
-        )
-        set_training_branch(model, "phase")
-        self.assertTrue(model.filter.refinement.training)
-        self.assertTrue(
-            all(p.requires_grad for p in model.filter.refinement.parameters())
-        )
 
     def test_warm_start_adds_identity_and_preserves_both_networks(self):
         old = DNQSM(laplacian_model_config((2, 4), filter_refinement_features=0)).eval()
@@ -147,17 +130,6 @@ class PhaseRefinementTests(unittest.TestCase):
             resized.initialize_from(new)
 
     def test_checkpoint_defaults_custom_width_and_legacy_inference(self):
-        self.assertEqual(model_config(parse_args([])).filter_refinement_features, 0)
-        self.assertEqual(OverfitConfig().filter_refinement_features, 0)
-        self.assertEqual(
-            model_config(
-                parse_args(["--filter-refinement-features", "16"])
-            ).filter_refinement_features,
-            16,
-        )
-        self.assertEqual(
-            checkpoint_training_config({})["filter_refinement_features"], 0
-        )
         field, mask = self.fields()
         with tempfile.TemporaryDirectory() as temporary:
             for width in (0, 7):

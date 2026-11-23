@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from dataclasses import asdict
@@ -9,7 +8,6 @@ import torch
 from dnqsm.model import DNQSM
 from dnqsm.physics import apply_multiplier, cutoff_kernels, dipole_tensor, masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import TrainConfig, model_config, parse_args
 from tests.helpers import laplacian_model_config
 
 
@@ -149,41 +147,6 @@ class LaplacianInputTests(unittest.TestCase):
                     torch.testing.assert_close(
                         loaded.laplacian_kernel, model.laplacian_kernel
                     )
-
-    def test_training_defaults_and_legacy_resume_select_correct_architecture(self):
-        self.assertTrue(model_config(TrainConfig()).laplacian_input)
-        self.assertFalse(
-            model_config(
-                parse_args(
-                    [
-                        "--filter-input-version",
-                        "1",
-                        "--no-laplacian-input",
-                        "--no-filter-laplacian-residual",
-                        "--conditional-laplacian-threshold",
-                        "0",
-                    ]
-                )
-            ).laplacian_input
-        )
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "old.pt"
-            old_config = asdict(TrainConfig(features=(2, 4)))
-            old_config.pop("laplacian_input")
-            old_config.pop("filter_input_version")
-            old_config.pop("filter_pretrain_epochs")
-            old_config.pop("conditional_laplacian_threshold")
-            old_config.pop("filter_laplacian_residual")
-            torch.save(dict(config=old_config), path)
-            resumed = parse_args(["--resume", str(path)])
-            self.assertFalse(model_config(resumed).laplacian_input)
-            self.assertEqual(resumed.filter_input_version, 1)
-            self.assertEqual(resumed.filter_pretrain_epochs, 0)
-            profile = Path(temporary) / "new.json"
-            profile.write_text(json.dumps(dict(features=[2, 4])))
-            self.assertTrue(
-                model_config(parse_args(["--config", str(profile)])).laplacian_input
-            )
 
     def test_masked_output_is_the_exact_tkd_input_and_ignores_exterior(self):
         model = DNQSM(laplacian_model_config((2, 4))).eval()

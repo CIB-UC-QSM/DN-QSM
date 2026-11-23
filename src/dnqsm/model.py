@@ -169,6 +169,10 @@ class Reconstruction:
     chi: Tensor
     harmonic_field: Tensor | None = None
 
+    @property
+    def initial_chi(self) -> Tensor:
+        return self.tkd
+
 
 @dataclass
 class FilteredFields:
@@ -506,8 +510,20 @@ class DualFieldUNet3D(CheckpointedNetwork):
         return local[crop], harmonic[crop]
 
 
-class DNQSM(nn.Module):
-    def __init__(self, config: ModelConfig | None = None):
+def susceptibility_unet(config: ModelConfig) -> UNet3D:
+    return UNet3D(
+        config.features,
+        config.checkpoint_blocks,
+        activation=config.activation,
+        leaky_relu_slope=config.leaky_relu_slope,
+        downsampling=config.downsampling,
+        bias=config.bias,
+        normalization=config.normalization_layer,
+    )
+
+
+class LocalFieldEstimator(nn.Module):
+    def __init__(self, config: ModelConfig | None = None, *, _defer_refinement=False):
         super().__init__()
         self.config = config or ModelConfig()
         # Runtime inference policy, saved separately from architecture/weights.
@@ -539,15 +555,10 @@ class DNQSM(nn.Module):
                 normalization=self.config.normalization_layer,
             )
         )
-        self.null_network = UNet3D(
-            self.config.features,
-            self.config.checkpoint_blocks,
-            activation=self.config.activation,
-            leaky_relu_slope=self.config.leaky_relu_slope,
-            downsampling=self.config.downsampling,
-            bias=self.config.bias,
-            normalization=self.config.normalization_layer,
-        )
+        if not _defer_refinement:
+            self._build_refinement()
+
+    def _build_refinement(self) -> None:
         # Register under filter so phase/chi freezing and gradient diagnostics
         # include the refinement. Build last to preserve both U-Nets' RNG draws.
         self.filter.refinement = (
@@ -561,87 +572,6 @@ class DNQSM(nn.Module):
             if self.config.filter_refinement_features
             else nn.Identity()
         )
-
-    def initialize_from(self, source: "DNQSM") -> None:
-        """Warm-start compatible weights, adding an identity refinement if needed."""
-        if (source.config.downsampling, source.config.bias) != (
-            self.config.downsampling,
-            self.config.bias,
-        ):
-            raise ValueError(
-                "Initialization checkpoint has different downsampling or layer biases; start a fresh run"
-            )
-        if tuple(source.config.features) != tuple(self.config.features):
-            raise ValueError(
-                "Initialization checkpoint has different U-Net widths or depth; "
-                "start a fresh run for the deeper architecture"
-            )
-        if any(
-            getattr(source.config, name) != getattr(self.config, name)
-            for name in (
-                "filter_input_version",
-                "laplacian_input",
-                "residual_filter",
-                "full_grid_field",
-                "filter_laplacian_residual",
-            )
-        ):
-            raise ValueError(
-                "Initialization checkpoint has a different filtering architecture"
-            )
-        state = source.state_dict()
-        if source.config.normalization_layer != self.config.normalization_layer:
-            if self.config.normalization_layer != "residual_instance":
-                raise ValueError(
-                    "Initialization cannot discard learned normalization residuals"
-                )
-            # The added zero gains preserve the transferred feature transform.
-            state.update(
-                {
-                    name: value
-                    for name, value in self.state_dict().items()
-                    if name.endswith("residual_gain")
-                }
-            )
-        # A new run may explicitly reuse learned weights with a new input
-        # operator; its deterministic stencil buffer belongs to the target.
-        if source.config.laplacian_operator != self.config.laplacian_operator:
-            if self.laplacian_kernel is None:
-                state.pop("laplacian_kernel", None)
-            else:
-                state["laplacian_kernel"] = self.laplacian_kernel
-        if (
-            source.config.filter_refinement_features
-            != self.config.filter_refinement_features
-        ):
-            if source.config.filter_refinement_features:
-                raise ValueError(
-                    "Initialization cannot remove or resize a trained phase refinement block"
-                )
-            self.filter.refinement.zero_output()
-            state.update(
-                {
-                    "filter.refinement." + name: value
-                    for name, value in self.filter.refinement.state_dict().items()
-                }
-            )
-        if self.config.filter_output_skip and not source.config.filter_output_skip:
-            keys = (
-                [
-                    "filter.local_decoder.final.weight",
-                    "filter.harmonic_decoder.final.weight",
-                ]
-                if self.config.filter_input_version == 3
-                else ["filter.final.weight"]
-            )
-            for key in keys:
-                weight = state[key]
-                state[key] = torch.cat((weight, torch.zeros_like(weight[:, :1])), dim=1)
-        elif source.config.filter_output_skip and not self.config.filter_output_skip:
-            raise ValueError(
-                "Initialization cannot discard a trained filter output skip"
-            )
-        self.load_state_dict(state)
 
     def predict_fields(self, total_field: Tensor, mask: Tensor) -> FilteredFields:
         """Predict both fields in ppm from the masked, RMS-normalized total field."""
@@ -782,6 +712,94 @@ class DNQSM(nn.Module):
         if self.inference_config.window_size:
             return sliding_window_fields(self, total_field, mask, self.inference_config)
         return self.predict_fields(total_field, mask)
+
+
+class DNQSM(LocalFieldEstimator):
+    def __init__(self, config: ModelConfig | None = None):
+        super().__init__(config, _defer_refinement=True)
+        self.null_network = susceptibility_unet(self.config)
+        self._build_refinement()
+
+    def initialize_from(self, source: "DNQSM") -> None:
+        """Warm-start compatible weights, adding an identity refinement if needed."""
+        if (source.config.downsampling, source.config.bias) != (
+            self.config.downsampling,
+            self.config.bias,
+        ):
+            raise ValueError(
+                "Initialization checkpoint has different downsampling or layer biases; start a fresh run"
+            )
+        if tuple(source.config.features) != tuple(self.config.features):
+            raise ValueError(
+                "Initialization checkpoint has different U-Net widths or depth; "
+                "start a fresh run for the deeper architecture"
+            )
+        if any(
+            getattr(source.config, name) != getattr(self.config, name)
+            for name in (
+                "filter_input_version",
+                "laplacian_input",
+                "residual_filter",
+                "full_grid_field",
+                "filter_laplacian_residual",
+            )
+        ):
+            raise ValueError(
+                "Initialization checkpoint has a different filtering architecture"
+            )
+        state = source.state_dict()
+        if source.config.normalization_layer != self.config.normalization_layer:
+            if self.config.normalization_layer != "residual_instance":
+                raise ValueError(
+                    "Initialization cannot discard learned normalization residuals"
+                )
+            # The added zero gains preserve the transferred feature transform.
+            state.update(
+                {
+                    name: value
+                    for name, value in self.state_dict().items()
+                    if name.endswith("residual_gain")
+                }
+            )
+        # A new run may explicitly reuse learned weights with a new input
+        # operator; its deterministic stencil buffer belongs to the target.
+        if source.config.laplacian_operator != self.config.laplacian_operator:
+            if self.laplacian_kernel is None:
+                state.pop("laplacian_kernel", None)
+            else:
+                state["laplacian_kernel"] = self.laplacian_kernel
+        if (
+            source.config.filter_refinement_features
+            != self.config.filter_refinement_features
+        ):
+            if source.config.filter_refinement_features:
+                raise ValueError(
+                    "Initialization cannot remove or resize a trained phase refinement block"
+                )
+            self.filter.refinement.zero_output()
+            state.update(
+                {
+                    "filter.refinement." + name: value
+                    for name, value in self.filter.refinement.state_dict().items()
+                }
+            )
+        if self.config.filter_output_skip and not source.config.filter_output_skip:
+            keys = (
+                [
+                    "filter.local_decoder.final.weight",
+                    "filter.harmonic_decoder.final.weight",
+                ]
+                if self.config.filter_input_version == 3
+                else ["filter.final.weight"]
+            )
+            for key in keys:
+                weight = state[key]
+                state[key] = torch.cat((weight, torch.zeros_like(weight[:, :1])), dim=1)
+        elif source.config.filter_output_skip and not self.config.filter_output_skip:
+            raise ValueError(
+                "Initialization cannot discard a trained filter output skip"
+            )
+        self.load_state_dict(state)
 
     @torch.inference_mode()
     def infer(

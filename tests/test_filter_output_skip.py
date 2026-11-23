@@ -9,10 +9,8 @@ import torch
 import torch.nn.functional as F
 
 from dnqsm.model import DNQSM, UNet3D
-from dnqsm.overfit import OverfitConfig
 from dnqsm.physics import masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, model_config, parse_args
 from tests.helpers import laplacian_model_config
 
 
@@ -138,12 +136,6 @@ class FilterOutputSkipTests(unittest.TestCase):
                         rtol=0,
                         atol=0,
                     )
-        self.assertTrue(model_config(parse_args([])).filter_output_skip)
-        self.assertTrue(OverfitConfig().filter_output_skip)
-        self.assertFalse(
-            model_config(parse_args(["--no-filter-output-skip"])).filter_output_skip
-        )
-        self.assertFalse(checkpoint_training_config({})["filter_output_skip"])
 
     def test_missing_or_misaligned_skip_is_rejected(self):
         network = UNet3D((2, 4), output_skip_channels=1)

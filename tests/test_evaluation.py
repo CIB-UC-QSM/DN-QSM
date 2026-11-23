@@ -12,12 +12,13 @@ from scipy.io import savemat
 from dnqsm.evaluation import (
     center_pad,
     evaluate_checkpoint,
+    evaluate_model,
     load_cosmos_case,
     load_sim2_case,
 )
 from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import apply_dipole, dipole_tensor
-from dnqsm.training import atomic_save
+from dnqsm.runtime import atomic_save
 
 
 def cosmos_fixture(root: Path):
@@ -148,6 +149,26 @@ class EvaluationTests(unittest.TestCase):
             self.assertEqual(
                 json.loads((root / "output/sim2/metadata.json").read_text())["factor"],
                 1.0,
+            )
+
+    def test_evaluate_model_restores_mode_and_can_skip_volume_exports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            simulation, *_ = cosmos_fixture(root)
+            model = DNQSM(ModelConfig((2, 4))).train()
+            before = {key: value.clone() for key, value in model.state_dict().items()}
+            rng = torch.get_rng_state()
+            output = root / "output"
+            metrics = evaluate_model(
+                model, [load_cosmos_case(simulation)], output, export_volumes=False
+            )
+            self.assertTrue(model.training)
+            torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+            torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
+            self.assertEqual(json.loads((output / "metrics.json").read_text()), metrics)
+            self.assertEqual(
+                {path.name for path in (output / "cosmos").iterdir()},
+                {"comparison.png", "metadata.json", "metrics.json"},
             )
 
 

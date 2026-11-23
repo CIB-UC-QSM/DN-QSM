@@ -393,6 +393,40 @@ def truncated_gradient_descent(
         return torch.fft.irfftn(estimate, s=field.shape[-3:], dim=SPATIAL)
 
 
+def clipped_tkd(field: Tensor, dipole: Tensor, threshold: float = 0.1) -> Tensor:
+    """Dipole division with a sign-preserving floor on the denominator."""
+    if not math.isfinite(threshold) or threshold <= 0:
+        raise ValueError("TKD threshold must be finite and positive")
+    kernel = rfft_kernel(dipole, field.shape[-3:])
+    return apply_multiplier(field, kernel.sign() / kernel.abs().clamp_min(threshold))
+
+
+def linear_gradient_descent(
+    field: Tensor, dipole: Tensor, iterations: int = 30
+) -> Tensor:
+    """Zero-start least squares with the full dipole and early stopping."""
+    if type(iterations) is not int or iterations < 0:
+        raise ValueError("iterations must be a nonnegative integer")
+    with torch.autocast(field.device.type, enabled=False):
+        kernel = rfft_kernel(dipole, field.shape[-3:])
+        if not bool(torch.isfinite(kernel).all()):
+            raise ValueError("Dipole must be finite")
+        if not iterations:
+            return field.float() * 0
+        power = kernel.square()
+        bound = power.amax(dim=SPATIAL, keepdim=True)
+        # Evaluate the exact finite-step response without subtracting nearly
+        # equal numbers at weak frequencies or taking log1p(-1) in backward.
+        ratio = power / torch.where(bound > 0, bound, 1)
+        full_step = ratio >= 1
+        response = -torch.expm1(
+            iterations * torch.log1p(-ratio.masked_fill(full_step, 0))
+        )
+        response = response.masked_fill(full_step, 1)
+        inverse = response / torch.where(kernel != 0, kernel, 1)
+        return apply_multiplier(field, inverse)
+
+
 def validate_mask(mask: Tensor, volume: Tensor | None = None) -> None:
     if (
         mask.ndim != 5

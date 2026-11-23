@@ -9,7 +9,6 @@ import torch
 from dnqsm.model import DNQSM, ModelConfig
 from dnqsm.physics import frequency_laplacian, frequency_laplacian_kernel, masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import checkpoint_training_config, parse_args
 
 
 class FrequencyLaplacianTests(unittest.TestCase):
@@ -167,12 +166,6 @@ class FrequencyLaplacianTests(unittest.TestCase):
                 self.assertEqual(
                     target.laplacian_kernel is None, target_operator == "frequency"
                 )
-        self.assertEqual(
-            checkpoint_training_config({})["laplacian_operator"], "stencil"
-        )
-        self.assertEqual(
-            parse_args([], use_default_profile=True).laplacian_operator, "frequency"
-        )
         with self.assertRaisesRegex(ValueError, "Laplacian operator"):
             replace(config, laplacian_operator="invalid")
         with self.assertRaisesRegex(ValueError, "FP32"):

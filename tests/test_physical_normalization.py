@@ -1,11 +1,7 @@
-import io
-import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
 from dataclasses import asdict, replace
 from pathlib import Path
-from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -13,13 +9,6 @@ from torch import nn
 from dnqsm.model import DNQSM, ModelConfig, ResidualInstanceNorm3d, instance_norm
 from dnqsm.physics import dipole_tensor, masked_rms
 from dnqsm.runtime import load_trained_model
-from dnqsm.training import (
-    TrainConfig,
-    checkpoint_training_config,
-    parse_args,
-    run_training,
-)
-from tests.helpers import make_dataset
 
 
 class PhysicalNormalizationTests(unittest.TestCase):
@@ -202,17 +191,6 @@ class PhysicalNormalizationTests(unittest.TestCase):
                 ValueError, "cannot discard learned normalization"
             ):
                 source.initialize_from(target)
-        legacy = checkpoint_training_config({})
-        self.assertEqual(
-            (legacy["field_normalization"], legacy["normalization_layer"]),
-            ("legacy", "instance"),
-        )
-        active = parse_args([], use_default_profile=True)
-        self.assertEqual(
-            (active.field_normalization, active.normalization_layer),
-            ("laplacian_rms", "residual_instance"),
-        )
-        self.assertEqual(active.conditional_laplacian_threshold, 0)
         for kwargs in (
             dict(field_normalization="unknown"),
             dict(normalization_layer="unknown"),
@@ -220,61 +198,3 @@ class PhysicalNormalizationTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 ModelConfig(**kwargs)
-
-    def test_residual_normalization_training_resumes_exactly_and_logs_policy(self):
-        with tempfile.TemporaryDirectory() as temp, redirect_stdout(io.StringIO()):
-            root = Path(temp)
-            data = make_dataset(root)
-            config = TrainConfig(
-                data_dir=str(data),
-                cache_dir=str(root / "cache"),
-                run_dir=str(root / "whole"),
-                device="cpu",
-                cuda_memory_gb=0,
-                epochs=2,
-                filter_pretrain_epochs=0,
-                training_schedule="joint",
-                features=(2, 4),
-                batch_size=3,
-                num_workers=0,
-                threads=2,
-                bf16=False,
-                comet=False,
-                evaluate_external=False,
-                val_views=1,
-                field_normalization="laplacian_rms",
-                normalization_layer="residual_instance",
-            )
-            with patch("dnqsm.training.reconstruction_figure", return_value=None):
-                whole = run_training(config)
-                part = run_training(
-                    replace(config, run_dir=str(root / "part"), max_steps=1)
-                )
-                resumed = parse_args(
-                    ["--resume", str(part / "training_last.pt"), "--max-steps", "0"]
-                )
-                run_training(resumed)
-            a, b = [
-                torch.load(p / "training_last.pt", weights_only=True)
-                for p in (whole, part)
-            ]
-            for name in a["model"]:
-                torch.testing.assert_close(
-                    a["model"][name], b["model"][name], rtol=0, atol=0
-                )
-            self.assertTrue(
-                any(
-                    float(v.abs()) > 0
-                    for n, v in a["model"].items()
-                    if n.endswith("residual_gain")
-                )
-            )
-            events = [
-                json.loads(line)
-                for line in (whole / "metrics.jsonl").read_text().splitlines()
-            ]
-            started = next(r for r in events if r["event"] == "started")
-            self.assertEqual(started["field_normalization"], "laplacian_rms")
-            self.assertEqual(started["normalization_layer"], "residual_instance")
-            with self.assertRaisesRegex(ValueError, "Resume configuration changed"):
-                run_training(replace(resumed, field_normalization="legacy"))
