@@ -32,6 +32,9 @@ def main():
     parser.add_argument(
         "--output-dir", type=Path, help="Run directory under the checkpoint root"
     )
+    parser.add_argument(
+        "--resume-from", type=Path, help="Previous run directory with completed stages"
+    )
     parser.add_argument("--cosmos-simulation", type=Path)
     parser.add_argument("--data-dir", type=Path, help="sim2 evaluation input directory")
     parser.add_argument("--device", default="cuda:0")
@@ -91,7 +94,7 @@ def main():
     output.mkdir(parents=True, exist_ok=False)
     tag = f"comparison-{run_id}"
     training_dir = output / "training"
-    train_comparison(
+    manifest = train_comparison(
         args.patch_dir,
         training_dir,
         device=device,
@@ -108,11 +111,14 @@ def main():
         batch_sizes=batch_sizes,
         probe_batch_sizes=probe_batch_sizes,
         comparison_tag=tag,
+        resume_from=(root / args.resume_from / "training")
+        if args.resume_from
+        else None,
     )
     experiment = _start_experiment(
         output,
         "evaluation",
-        tag,
+        manifest["comparison_tag"],
         archive_dir=training_dir / "comet",
     )
     try:

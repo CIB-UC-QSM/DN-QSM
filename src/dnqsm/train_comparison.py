@@ -2,7 +2,9 @@
 
 import argparse
 import hashlib
+import json
 import os
+import shutil
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
@@ -392,6 +394,34 @@ def _fit(
     )
 
 
+def _reuse_completed_stages(source, output, manifest):
+    previous = json.loads((source / "validation.json").read_text())
+    comparable = json.loads(json.dumps(manifest))
+    for key in ("version", "model_config", "inference_config", "inverses"):
+        if previous[key] != comparable[key]:
+            raise ValueError(f"Resume manifest has different {key}")
+    if previous["dataset"]["sha256"] != comparable["dataset"]["sha256"]:
+        raise ValueError("Resume manifest has a different patch dataset")
+    previous_training = {"physics_loss_weight": 0.0, **previous["training"]}
+    for key, value in comparable["training"].items():
+        if key not in ("batch_size", "workers") and previous_training.get(key) != value:
+            raise ValueError(f"Resume manifest has different training setting {key}")
+    completed = previous["stages"]
+    if set(completed) != set(STAGES[: len(completed)]):
+        raise ValueError("Resume manifest must contain a prefix of completed stages")
+    for stage, record in completed.items():
+        path = source / f"{stage}.pt"
+        if record["checkpoint"] != path.name or not path.is_file():
+            raise ValueError(f"Resume checkpoint is missing or unexpected for {stage}")
+    output.mkdir(parents=True, exist_ok=False)
+    for stage, record in completed.items():
+        filename = record["checkpoint"]
+        shutil.copyfile(source / filename, output / filename)
+        manifest["stages"][stage] = record
+    manifest["comparison_tag"] = previous["comparison_tag"]
+    write_json(output / "validation.json", manifest)
+
+
 def train_comparison(
     dataset,
     output,
@@ -406,6 +436,7 @@ def train_comparison(
     probe_batch_sizes=False,
     batch_sizes=None,
     comparison_tag=None,
+    resume_from=None,
 ):
     """Fit the direct model, one shared field estimator, and four correction arms."""
     if training.batch_size < 1:
@@ -466,7 +497,10 @@ def train_comparison(
         stages={},
     )
     manifest["comparison_tag"] = comparison_tag or f"comparison-{uuid4().hex}"
-    output.mkdir(parents=True, exist_ok=False)
+    if resume_from is None:
+        output.mkdir(parents=True, exist_ok=False)
+    else:
+        _reuse_completed_stages(Path(resume_from), output, manifest)
 
     def fit_attempt(stage, model, target, stage_training, peak, attempt, legacy):
         experiment = _start_experiment(output, stage, manifest["comparison_tag"])
@@ -564,14 +598,17 @@ def train_comparison(
         manifest["stages"][stage] = record
         write_json(output / "validation.json", manifest)
 
-    torch.manual_seed(training.seed)
-    direct = DirectSusceptibility(model_config).to(device)
-    fit(DIRECT, direct, "chi")
-    del direct
+    if DIRECT not in manifest["stages"]:
+        torch.manual_seed(training.seed)
+        direct = DirectSusceptibility(model_config).to(device)
+        fit(DIRECT, direct, "chi")
+        del direct
 
     torch.manual_seed(training.seed)
-    estimator = LocalFieldEstimator(model_config).to(device)
-    fit("local_field", estimator, "local_field")
+    estimator = LocalFieldEstimator(model_config)
+    if "local_field" not in manifest["stages"]:
+        estimator.to(device)
+        fit("local_field", estimator, "local_field")
     field_checkpoint = output / manifest["stages"]["local_field"]["checkpoint"]
     estimator.zero_grad(set_to_none=True)
     estimator.cpu()
@@ -585,15 +622,19 @@ def train_comparison(
     dnqsm.filter.load_state_dict(estimator.filter.state_dict())
     residual_start = dnqsm.null_network.state_dict()
     for inverse in INVERSES:
+        stage = f"model3_{inverse}"
+        if stage in manifest["stages"]:
+            continue
         baseline = LocalFieldBaseline(
             deepcopy(estimator), inverse, correction=True, **inverses
         )
         baseline.residual.load_state_dict(residual_start)
-        fit(f"model3_{inverse}", baseline.to(device), "chi")
+        fit(stage, baseline.to(device), "chi")
         del baseline
     del residual_start, estimator
 
-    fit(DNQSM_ARM, dnqsm.to(device), "chi", legacy=True)
+    if DNQSM_ARM not in manifest["stages"]:
+        fit(DNQSM_ARM, dnqsm.to(device), "chi", legacy=True)
     write_json(output / "comparison.json", manifest)
     return manifest
 

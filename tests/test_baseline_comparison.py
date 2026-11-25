@@ -54,7 +54,9 @@ class BaselineComparisonTests(unittest.TestCase):
             [len(batch["value"]) for batch in _boundary_batches(loader)], [3, 2]
         )
 
-    def test_cuda_oom_retries_with_initial_weights(self):
+    def test_cuda_oom_retries_with_initial_weights_and_resume_skips_completed_stage(
+        self,
+    ):
         experiment = Mock()
         experiment.get_key.return_value = "experiment-key"
         failed_weights = None
@@ -112,6 +114,26 @@ class BaselineComparisonTests(unittest.TestCase):
             self.assertEqual(train_stage.call_count, 7)
             experiment.log_other.assert_called_once_with(
                 "stage_status", "cuda_out_of_memory"
+            )
+
+            manifest["stages"] = {"model1": manifest["stages"]["model1"]}
+            (first_run / "validation.json").write_text(json.dumps(manifest))
+            train_stage.reset_mock()
+            resumed = train_comparison(
+                root,
+                root / "resumed",
+                features=(2,),
+                device="cuda:0",
+                training=config,
+                resume_from=first_run,
+            )
+            self.assertEqual(train_stage.call_count, 5)
+            self.assertEqual(train_stage.call_args_list[0].args[5], "local_field")
+            self.assertEqual(resumed["comparison_tag"], manifest["comparison_tag"])
+            self.assertEqual(resumed["stages"]["model1"], manifest["stages"]["model1"])
+            self.assertEqual(
+                (root / "resumed/model1.pt").read_bytes(),
+                (first_run / "model1.pt").read_bytes(),
             )
 
     def test_five_epochs_include_each_partial_batch_and_log_epoch(self):

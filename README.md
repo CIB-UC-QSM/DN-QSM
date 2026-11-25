@@ -243,4 +243,7 @@ without the preset ceiling or `--batch-size` to supply an initial batch size
 for every stage.
 
 If CUDA runs out of memory during training, the runner restarts the affected
-stage with its initial weights and half the batch size, down to one.
+stage with its initial weights and half the batch size, down to one. To reuse
+completed stages from an interrupted comparison, pass `--resume-from` with
+the previous run directory. The runner copies the completed checkpoints into
+the new run directory and uses the original Comet comparison tag.
