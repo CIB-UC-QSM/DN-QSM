@@ -15,15 +15,22 @@ from .inference import SlidingWindowConfig
 from .logging import _pyplot, comparison_figure, nrmse_label, write_json
 from .model import LocalFieldEstimator, ModelConfig
 from .runtime import autocast_context, load_trained_model, require_device
-from .train_comparison import DIRECT, DNQSM_ARM, MANIFEST_VERSION
+from .train_comparison import (
+    DIRECT,
+    DNQSM_ARM,
+    LEGACY_MANIFEST_VERSION,
+    MANIFEST_VERSION,
+)
 
 
 def load_comparison(manifest_path, device):
     """Yield named models with the selected comparison weights."""
     path = Path(manifest_path)
     manifest = json.loads(path.read_text())
-    if manifest["version"] != MANIFEST_VERSION:
+    version = manifest["version"]
+    if version not in (LEGACY_MANIFEST_VERSION, MANIFEST_VERSION):
         raise ValueError("Unsupported comparison manifest version")
+    legacy = version == LEGACY_MANIFEST_VERSION
     stages = manifest["stages"]
     model_config = dict(manifest["model_config"])
     model_config["features"] = tuple(model_config["features"])
@@ -32,10 +39,7 @@ def load_comparison(manifest_path, device):
     def load(module, stage):
         checkpoint = path.parent / stages[stage]["checkpoint"]
         saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-        if (
-            saved.get("comparison_version") != MANIFEST_VERSION
-            or saved.get("stage") != stage
-        ):
+        if saved.get("comparison_version") != version or saved.get("stage") != stage:
             raise ValueError(
                 f"Unexpected comparison checkpoint for {stage}: {checkpoint}"
             )
@@ -53,10 +57,13 @@ def load_comparison(manifest_path, device):
         baseline = LocalFieldBaseline(estimator, inverse, **manifest["inverses"])
         yield f"model2_{inverse}", baseline.eval()
         baseline = LocalFieldBaseline(
-            estimator, inverse, correction=True, **manifest["inverses"]
+            estimator if legacy else LocalFieldEstimator(config),
+            inverse,
+            correction=True,
+            **manifest["inverses"],
         )
         stage = f"model3_{inverse}"
-        load(baseline.residual, stage)
+        load(baseline.residual if legacy else baseline, stage)
         yield stage, baseline.to(device).eval()
         del baseline
     del estimator

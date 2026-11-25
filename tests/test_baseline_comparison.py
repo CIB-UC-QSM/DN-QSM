@@ -60,7 +60,6 @@ class BaselineComparisonTests(unittest.TestCase):
             make_loader.return_value = train
             result = _fit(
                 model,
-                model,
                 "chi",
                 None,
                 None,
@@ -171,11 +170,27 @@ class BaselineComparisonTests(unittest.TestCase):
             self.assertEqual(dnqsm.inference_config.window_size, PATCH_SIZE)
             plain = models["model3_tikhonov"]
             initial = models["model2_tikhonov"]
-            self.assertIs(plain.estimator, initial.estimator)
-            for key, val in initial.estimator.filter.state_dict().items():
-                torch.testing.assert_close(
-                    val, dnqsm.filter.state_dict()[key], rtol=0, atol=0
-                )
+            for inverse in ("tkd", "tikhonov", "gd"):
+                self.assertIs(models[f"model2_{inverse}"].estimator, initial.estimator)
+            corrected = [models[f"model3_{inv}"] for inv in ("tkd", "tikhonov", "gd")]
+            trained_filters = [model.estimator.filter for model in corrected]
+            trained_filters.append(dnqsm.filter)
+            self.assertEqual(len({initial.estimator.filter, *trained_filters}), 5)
+            torch.manual_seed(training.seed)
+            initial_correction = DNQSM(dnqsm.config).null_network.state_dict()
+            trained_corrections = [model.residual for model in corrected]
+            trained_corrections.append(dnqsm.null_network)
+            for trained_group, start in (
+                (trained_filters, initial.estimator.filter.state_dict()),
+                (trained_corrections, initial_correction),
+            ):
+                for trained in trained_group:
+                    self.assertTrue(
+                        any(
+                            not torch.equal(value, start[key])
+                            for key, value in trained.state_dict().items()
+                        )
+                    )
             self.assertEqual(
                 plain.residual.state_dict().keys(),
                 dnqsm.null_network.state_dict().keys(),
@@ -188,19 +203,13 @@ class BaselineComparisonTests(unittest.TestCase):
             dipole[0, 0, 0] = 0
             for window_size in (0, 4):
                 policy = SlidingWindowConfig(window_size=window_size)
-                a = initial.infer(field, roi, dipole, inference=policy)
                 b = plain.infer(field, roi, dipole, inference=policy)
                 c = dnqsm.infer(field, roi, dipole, **asdict(policy))
                 for result in (b, c):
                     torch.testing.assert_close(
-                        a.local_field, result.local_field, rtol=0, atol=0
-                    )
-                    torch.testing.assert_close(
-                        a.initial_chi, result.initial_chi, rtol=0, atol=0
-                    )
-                    torch.testing.assert_close(
                         result.chi, result.initial_chi + result.correction
                     )
+            dnqsm.filter.load_state_dict(plain.estimator.filter.state_dict())
             dnqsm.null_network.load_state_dict(plain.residual.state_dict())
             b = plain.infer(field, roi, dipole, inference=policy)
             c = dnqsm.infer(field, roi, dipole, **asdict(policy))

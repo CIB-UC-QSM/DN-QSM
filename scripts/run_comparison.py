@@ -17,12 +17,12 @@ CHECKPOINT_ROOT = Path("/Workspace/D/DN-QSM")
 MOUNTED_CHECKPOINT_ROOT = Path("/WorkSpace/D/DN-QSM")
 CALIBRATED_GPU = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
 CALIBRATED_BATCH_SIZES = {
-    "model1": 256,
-    "local_field": 266,
-    "model3_tkd": 295,
-    "model3_tikhonov": 295,
-    "model3_gd": 295,
-    "model4": 295,
+    "model1": 224,
+    "local_field": 224,
+    "model3_tkd": 160,
+    "model3_tikhonov": 160,
+    "model3_gd": 160,
+    "model4": 160,
 }
 
 

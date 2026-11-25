@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from io import BytesIO
 from math import isfinite
@@ -27,7 +28,8 @@ from .runtime import (
     require_device,
 )
 
-MANIFEST_VERSION = 1
+LEGACY_MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 DIRECT = "model1"
 DNQSM_ARM = "model4"
 
@@ -95,18 +97,12 @@ def _relative_error(prediction, target, mask):
     return error.flatten(), energy.flatten()
 
 
-def _optimizer(weights, config):
+def _optimizer(model, config):
     return torch.optim.AdamW(
-        (p for p in weights.parameters() if p.requires_grad),
+        model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
-
-
-def _train_mode(model, frozen):
-    model.train()
-    if frozen is not None:
-        frozen.eval()
 
 
 def _update(model, optimizer, batch, target_name, dipole, device, bf16):
@@ -124,20 +120,20 @@ def _update(model, optimizer, batch, target_name, dipole, device, bf16):
     return value
 
 
-def _probe_batch_size(model, weights, frozen, target, dataset, stage, device, config):
+def _probe_batch_size(model, target, dataset, stage, device, config):
     """Find the largest batch that fits the configured CUDA allocator budget."""
     data = make_patch_dataloader(dataset, seed=config.seed).dataset
     dipole = data.dipole(device)
     initial = {
         name: tensor.detach().to("cpu", copy=True)
-        for name, tensor in weights.state_dict().items()
+        for name, tensor in model.state_dict().items()
     }
-    _train_mode(model, frozen)
+    model.train()
 
     def trial(size):
         loader = make_patch_dataloader(dataset, batch_size=size, seed=config.seed)
         batch = next(iter(loader))
-        optimizer = _optimizer(weights, config)
+        optimizer = _optimizer(model, config)
         for _ in range(2):
             _update(model, optimizer, batch, target, dipole, device, config.bf16)
         torch.cuda.synchronize(device)
@@ -151,8 +147,8 @@ def _probe_batch_size(model, weights, frozen, target, dataset, stage, device, co
         except torch.cuda.OutOfMemoryError:
             peak = None
         finally:
-            weights.zero_grad(set_to_none=True)
-            weights.load_state_dict(initial)
+            model.zero_grad(set_to_none=True)
+            model.load_state_dict(initial)
             torch.cuda.empty_cache()
         result = "OOM" if peak is None else f"{peak:.2f} GiB reserved"
         print(f"{stage} batch probe {size}: {result}", flush=True)
@@ -244,7 +240,6 @@ def _log_validation_image(experiment, preview, target_name, step):
 
 def _fit(
     model,
-    weights,
     target_name,
     dataset,
     validation,
@@ -254,7 +249,6 @@ def _fit(
     config,
     checkpoint_metadata,
     experiment,
-    frozen=None,
 ):
     train = make_patch_dataloader(
         dataset,
@@ -263,7 +257,7 @@ def _fit(
         seed=config.seed,
     )
     dipole = train.dataset.dipole(device)
-    optimizer = _optimizer(weights, config)
+    optimizer = _optimizer(model, config)
     steps_per_epoch = len(train)
     if not steps_per_epoch:
         raise ValueError("Training split has no batches")
@@ -281,7 +275,7 @@ def _fit(
     best = float("inf")
     checkpoint = output / f"{stage}.pt"
 
-    _train_mode(model, frozen)
+    model.train()
     for step in range(1, steps + 1):
         epoch = (step - 1) // steps_per_epoch + 1 if config.epochs is not None else None
         batch = next(batches, None)
@@ -313,7 +307,7 @@ def _fit(
                 atomic_save(
                     dict(
                         checkpoint_metadata,
-                        model=weights.state_dict(),
+                        model=model.state_dict(),
                         step=step,
                         validation_nrmse=score,
                     ),
@@ -324,7 +318,7 @@ def _fit(
                     {"nrmse_pct": score, "best_nrmse_pct": best}, step=step, epoch=epoch
                 )
                 _log_validation_image(experiment, preview, target_name, step)
-            _train_mode(model, frozen)
+            model.train()
     return dict(
         checkpoint=checkpoint.name,
         target=target_name,
@@ -408,7 +402,7 @@ def train_comparison(
     comparison_tag = comparison_tag or f"comparison-{uuid4().hex}"
     manifest["comparison_tag"] = comparison_tag
 
-    def fit(stage, model, weights, target, *, legacy=False, frozen=None):
+    def fit(stage, model, target, *, legacy=False):
         experiment = _start_experiment(output, stage, comparison_tag)
         try:
             peak = None
@@ -417,7 +411,7 @@ def train_comparison(
                 batch_size = batch_sizes[stage]
             elif probe_batch_sizes:
                 batch_size, peak = _probe_batch_size(
-                    model, weights, frozen, target, dataset, stage, device, training
+                    model, target, dataset, stage, device, training
                 )
                 print(f"{stage} selected batch size {batch_size}", flush=True)
             stage_training = replace(training, batch_size=batch_size)
@@ -445,7 +439,6 @@ def train_comparison(
             )
             record = _fit(
                 model,
-                weights,
                 target,
                 dataset,
                 validation,
@@ -457,7 +450,6 @@ def train_comparison(
                 if legacy
                 else dict(metadata, comparison_version=MANIFEST_VERSION, stage=stage),
                 experiment,
-                frozen=frozen,
             )
             record["comet_experiment_key"] = experiment.get_key()
             record["batch_size"] = batch_size
@@ -470,36 +462,34 @@ def train_comparison(
 
     torch.manual_seed(training.seed)
     direct = DirectSusceptibility(model_config).to(device)
-    fit(DIRECT, direct, direct, "chi")
+    fit(DIRECT, direct, "chi")
     del direct
 
     torch.manual_seed(training.seed)
     estimator = LocalFieldEstimator(model_config).to(device)
-    fit("local_field", estimator, estimator, "local_field")
+    fit("local_field", estimator, "local_field")
     field_checkpoint = output / manifest["stages"]["local_field"]["checkpoint"]
+    estimator.zero_grad(set_to_none=True)
+    estimator.cpu()
     estimator.load_state_dict(
         torch.load(field_checkpoint, weights_only=True, map_location="cpu")["model"]
     )
-    estimator.eval().requires_grad_(False)
-    estimator.zero_grad(set_to_none=True)
     manifest["shared_field_checkpoint"] = field_checkpoint.name
 
     torch.manual_seed(training.seed)
     dnqsm = DNQSM(model_config)
     dnqsm.filter.load_state_dict(estimator.filter.state_dict())
-    dnqsm.filter.requires_grad_(False)
     residual_start = dnqsm.null_network.state_dict()
     for inverse in INVERSES:
         baseline = LocalFieldBaseline(
-            estimator, inverse, correction=True, **inverses
-        ).to(device)
+            deepcopy(estimator), inverse, correction=True, **inverses
+        )
         baseline.residual.load_state_dict(residual_start)
-        fit(f"model3_{inverse}", baseline, baseline.residual, "chi", frozen=estimator)
+        fit(f"model3_{inverse}", baseline.to(device), "chi")
         del baseline
     del residual_start, estimator
 
-    dnqsm.to(device)
-    fit(DNQSM_ARM, dnqsm, dnqsm, "chi", legacy=True, frozen=dnqsm.filter)
+    fit(DNQSM_ARM, dnqsm.to(device), "chi", legacy=True)
     write_json(output / "comparison.json", manifest)
     return manifest
 

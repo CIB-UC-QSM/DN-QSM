@@ -172,8 +172,10 @@ Model 1 directly predicts susceptibility. Model 2 applies clipped TKD,
 Tikhonov, or full-dipole linear gradient descent after local-field estimation.
 Model 3 learns a separate unrestricted correction for each inverse. Model 4
 uses Tikhonov and applies DN-QSM's spectral weighting to the learned correction.
-Models 2–4 share frozen local-field weights. Use the Tikhonov arms to compare
-inversion alone, unrestricted correction, and spectrally weighted correction.
+Model 2 uses the pretrained local-field estimator. Each Model 3 arm and Model 4
+starts from the same pretrained field weights and jointly updates its own field
+estimator and correction network. Use the Tikhonov arms to compare inversion
+alone, unrestricted correction, and spectrally weighted correction.
 
 Training defaults to 10,000 updates per stage, with validation every 1,000
 updates on fixed backgrounds. AHEAD validation determines the saved checkpoints.
