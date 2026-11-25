@@ -19,7 +19,7 @@ from .inference import SlidingWindowConfig
 from .logging import _pyplot, comparison_figure, write_json
 from .model import DEFAULT_FEATURES, DNQSM, LocalFieldEstimator, ModelConfig
 from .patch_data import PATCH_SIZE, make_patch_dataloader
-from .physics import masked_mean
+from .physics import apply_dipole, masked_mean
 from .runtime import (
     CHECKPOINT_VERSION,
     atomic_save,
@@ -45,6 +45,7 @@ class TrainingConfig:
     weight_decay: float = 1e-4
     bf16: bool = True
     epochs: int | None = None
+    physics_loss_weight: float = 1.0
 
 
 def _start_experiment(output, stage, comparison_tag, *, archive_dir=None):
@@ -105,19 +106,30 @@ def _optimizer(model, config):
     )
 
 
-def _update(model, optimizer, batch, target_name, dipole, device, bf16):
+def _update(model, optimizer, batch, target_name, dipole, device, config):
     optimizer.zero_grad(set_to_none=True)
     _, mask, target, prediction = _predict_target(
-        model, batch, target_name, dipole, device, bf16
+        model, batch, target_name, dipole, device, config.bf16
     )
     error, energy = _relative_error(prediction, target, mask)
-    loss = (error / energy.clamp_min(1e-8)).mean()
-    value = loss.item()
-    if not isfinite(value):
+    relative_mse = (error / energy.clamp_min(1e-8)).mean()
+    loss = relative_mse
+    metrics = {"relative_mse": relative_mse}
+    if target_name == "chi" and config.physics_loss_weight:
+        local = batch["local_field"].to(device, dtype=torch.float32)
+        projected = apply_dipole(prediction * mask, dipole)
+        residual = (projected - local) * mask
+        physics_l2 = torch.linalg.vector_norm(residual.flatten(1), dim=1).mean()
+        loss = loss + config.physics_loss_weight * physics_l2
+        metrics["physics_l2"] = physics_l2
+    metrics["loss"] = loss
+    values = torch.stack(tuple(metrics.values())).detach().tolist()
+    scalars = dict(zip(metrics, values, strict=True))
+    if not isfinite(scalars["loss"]):
         raise FloatingPointError("Nonfinite training loss")
     loss.backward()
     optimizer.step()
-    return value
+    return scalars
 
 
 def _probe_batch_size(model, target, dataset, stage, device, config):
@@ -135,7 +147,7 @@ def _probe_batch_size(model, target, dataset, stage, device, config):
         batch = next(iter(loader))
         optimizer = _optimizer(model, config)
         for _ in range(2):
-            _update(model, optimizer, batch, target, dipole, device, config.bf16)
+            _update(model, optimizer, batch, target, dipole, device, config)
         torch.cuda.synchronize(device)
         return torch.cuda.max_memory_reserved(device) / 1024**3
 
@@ -283,13 +295,13 @@ def _fit(
             batches = iter(train)
             batch = next(batches)
         try:
-            loss_value = _update(
-                model, optimizer, batch, target_name, dipole, device, config.bf16
+            metrics = _update(
+                model, optimizer, batch, target_name, dipole, device, config
             )
         except FloatingPointError as error:
             raise FloatingPointError(f"{error} at {stage} step {step}") from error
         with experiment.train():
-            experiment.log_metric("relative_mse", loss_value, step=step, epoch=epoch)
+            experiment.log_metrics(metrics, step=step, epoch=epoch)
         if step % validation_interval == 0 or step == steps:
             score, preview = _validate(
                 model, validation, target_name, dipole, device, config.bf16
@@ -345,6 +357,8 @@ def train_comparison(
     """Fit the direct model, one shared field estimator, and four correction arms."""
     if training.batch_size < 1:
         raise ValueError("Batch size must be positive")
+    if not isfinite(training.physics_loss_weight) or training.physics_loss_weight < 0:
+        raise ValueError("Physics loss weight must be finite and nonnegative")
     if training.epochs is not None:
         if training.epochs < 1:
             raise ValueError("Epochs must be positive")
@@ -513,6 +527,12 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--physics-loss-weight",
+        type=float,
+        default=TrainingConfig.physics_loss_weight,
+        help="Weight of the masked dipole forward L2 loss for susceptibility training",
+    )
     parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args(argv)
     torch.set_num_threads(args.threads)

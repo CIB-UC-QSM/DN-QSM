@@ -4,6 +4,7 @@ import unittest
 from dataclasses import asdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 from zipfile import ZipFile
 
@@ -27,12 +28,14 @@ from dnqsm.physics import (
     apply_multiplier,
     clipped_tkd,
     cutoff_kernels,
+    dipole_tensor,
     linear_gradient_descent,
 )
 from dnqsm.train_comparison import (
     TrainingConfig,
     _fit,
     _start_experiment,
+    _update,
     train_comparison,
 )
 
@@ -49,7 +52,9 @@ class BaselineComparisonTests(unittest.TestCase):
         with (
             TemporaryDirectory() as tmp,
             patch("dnqsm.train_comparison.make_patch_dataloader") as make_loader,
-            patch("dnqsm.train_comparison._update", return_value=0.25) as update,
+            patch(
+                "dnqsm.train_comparison._update", return_value={"relative_mse": 0.25}
+            ) as update,
             patch("dnqsm.train_comparison._validate", return_value=(50.0, None)),
             patch("dnqsm.train_comparison._log_validation_image"),
         ):
@@ -75,10 +80,46 @@ class BaselineComparisonTests(unittest.TestCase):
             [len(call.args[2]) for call in update.call_args_list], [2, 1] * 5
         )
         self.assertEqual(
-            [call.kwargs for call in experiment.log_metrics.call_args_list],
+            [
+                call.kwargs
+                for call in experiment.log_metrics.call_args_list
+                if "nrmse_pct" in call.args[0]
+            ],
             [{"step": 2 * epoch, "epoch": epoch} for epoch in range(1, 6)],
         )
         self.assertEqual([row["epoch"] for row in result["history"]], list(range(1, 6)))
+
+    def test_update_uses_clean_local_field_for_masked_physics_loss(self):
+        shape = (1, 1, 4, 4, 4)
+        chi = torch.arange(64, dtype=torch.float32).reshape(shape) / 64
+        mask = torch.ones_like(chi, dtype=torch.bool)
+        mask[..., -1] = False
+        prediction = torch.nn.Parameter(torch.where(mask, chi, 30.0))
+        dipole = dipole_tensor(shape[-3:])
+        projected = apply_dipole(chi * mask, dipole)
+        batch = dict(
+            chi=chi,
+            mask=mask,
+            local_field=torch.where(mask, projected + 0.25, 10.0),
+            total_field=torch.full_like(chi, 99),
+        )
+        model = Mock(return_value=SimpleNamespace(chi=prediction))
+        optimizer = torch.optim.SGD([prediction], lr=0)
+        metrics = _update(
+            model,
+            optimizer,
+            batch,
+            "chi",
+            dipole,
+            torch.device("cpu"),
+            TrainingConfig(physics_loss_weight=2.0),
+        )
+        expected = 0.25 * mask.sum().sqrt().item()
+        self.assertEqual(metrics["relative_mse"], 0)
+        self.assertAlmostEqual(metrics["physics_l2"], expected, places=6)
+        self.assertAlmostEqual(metrics["loss"], 2 * expected, places=6)
+        self.assertGreater(prediction.grad[mask].abs().sum().item(), 0)
+        self.assertEqual(prediction.grad[~mask].abs().sum().item(), 0)
 
     def test_clipped_tkd_keeps_weak_frequencies(self):
         field = torch.randn(1, 1, 4, 5, 6)
@@ -260,7 +301,11 @@ class BaselineComparisonTests(unittest.TestCase):
                         payload = message["payload"]
                         metric = payload["metric"]
                         metrics[payload.get("context"), metric["metricName"]] = metric
-                self.assertEqual(metrics["train", "relative_mse"]["step"], 1)
+                for name in ("relative_mse", "loss"):
+                    self.assertEqual(metrics["train", name]["step"], 1)
+                self.assertEqual(
+                    ("train", "physics_l2") in metrics, stage["target"] == "chi"
+                )
                 for name in ("nrmse_pct", "best_nrmse_pct"):
                     metric = metrics["validate", name]
                     self.assertEqual(metric["step"], 1)

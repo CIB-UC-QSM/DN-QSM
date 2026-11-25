@@ -46,6 +46,12 @@ def main():
         "--steps", type=int, help="Run a fixed number of updates per model"
     )
     parser.add_argument("--validation-interval", type=int, default=1_000)
+    parser.add_argument(
+        "--physics-loss-weight",
+        type=float,
+        default=TrainingConfig.physics_loss_weight,
+        help="Weight of the masked dipole forward L2 loss for susceptibility training",
+    )
     batching = parser.add_mutually_exclusive_group()
     batching.add_argument(
         "--batch-size", type=int, help="Override batch size for all stages"
@@ -95,6 +101,7 @@ def main():
             validation_interval=args.validation_interval,
             batch_size=1 if args.batch_size is None else args.batch_size,
             workers=args.workers,
+            physics_loss_weight=args.physics_loss_weight,
         ),
         features=args.features,
         cuda_memory_gb=args.cuda_memory_gb if device.type == "cuda" else None,

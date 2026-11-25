@@ -181,6 +181,12 @@ Training defaults to 10,000 updates per stage, with validation every 1,000
 updates on fixed backgrounds. AHEAD validation determines the saved checkpoints.
 Use `--device cpu --features 2 --steps 1 --batch-size 1` for a small test dataset.
 
+Susceptibility training adds a physics term to the relative MSE. The term is the
+batch mean of the per-patch L2 norms between the dipole forward projection of
+the masked susceptibility prediction and the clean local field, evaluated inside
+the patch mask. Set `--physics-loss-weight` to scale this term (default `1.0`).
+Comet records the total loss and its components.
+
 Each training stage has a Comet experiment. A shared tag links the six stages,
 and the local manifests record the experiment keys. Comet records relative MSE
 at each optimizer update and subject-averaged NRMSE at each validation, including
