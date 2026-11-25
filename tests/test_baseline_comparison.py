@@ -33,6 +33,7 @@ from dnqsm.physics import (
 )
 from dnqsm.train_comparison import (
     TrainingConfig,
+    _boundary_batches,
     _fit,
     _start_experiment,
     _update,
@@ -44,6 +45,74 @@ class BaselineComparisonTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         torch.set_num_threads(2)
+
+    def test_probe_covers_full_and_partial_batch_shapes(self):
+        loader = torch.utils.data.DataLoader(
+            [{"value": torch.tensor(i)} for i in range(5)], batch_size=3
+        )
+        self.assertEqual(
+            [len(batch["value"]) for batch in _boundary_batches(loader)], [3, 2]
+        )
+
+    def test_cuda_oom_retries_with_initial_weights(self):
+        experiment = Mock()
+        experiment.get_key.return_value = "experiment-key"
+        failed_weights = None
+
+        def fit(
+            model,
+            target,
+            data,
+            validation,
+            output,
+            stage,
+            device,
+            config,
+            checkpoint_metadata,
+            experiment,
+        ):
+            nonlocal failed_weights
+            first = next(model.parameters())
+            if stage == "model1" and config.batch_size == 8:
+                failed_weights = first.detach().clone()
+                with torch.no_grad():
+                    first.fill_(123)
+                raise torch.cuda.OutOfMemoryError("test OOM")
+            if stage == "model1":
+                self.assertEqual(config.batch_size, 4)
+                torch.testing.assert_close(first, failed_weights)
+            torch.save({"model": model.state_dict()}, output / f"{stage}.pt")
+            return {"checkpoint": f"{stage}.pt", "target": target}
+
+        with (
+            TemporaryDirectory() as tmp,
+            patch.object(
+                torch.nn.Module,
+                "to",
+                autospec=True,
+                side_effect=lambda module, device: module,
+            ),
+            patch("dnqsm.train_comparison.torch.cuda.empty_cache"),
+            patch(
+                "dnqsm.train_comparison.require_device",
+                return_value=torch.device("cuda:0"),
+            ),
+            patch("dnqsm.train_comparison._validation_loader"),
+            patch("dnqsm.train_comparison._start_experiment", return_value=experiment),
+            patch("dnqsm.train_comparison._fit", side_effect=fit) as train_stage,
+        ):
+            root = Path(tmp)
+            (root / "manifest.json").write_text("{}")
+            config = TrainingConfig(steps=1, batch_size=8)
+            first_run = root / "first"
+            manifest = train_comparison(
+                root, first_run, features=(2,), device="cuda:0", training=config
+            )
+            self.assertEqual(manifest["stages"]["model1"]["batch_size"], 4)
+            self.assertEqual(train_stage.call_count, 7)
+            experiment.log_other.assert_called_once_with(
+                "stage_status", "cuda_out_of_memory"
+            )
 
     def test_five_epochs_include_each_partial_batch_and_log_epoch(self):
         loader = torch.utils.data.DataLoader([1, 2, 3], batch_size=2)

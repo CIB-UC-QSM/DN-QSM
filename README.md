@@ -231,8 +231,16 @@ The evaluation experiment shares the training experiments' Comet tag and logs
 metrics and central-slice images for each dataset and arm. Offline archives for
 both phases are saved in `training/comet/`.
 
-The default architecture and 90 GiB budget use measured per-stage batch sizes
-on the RTX PRO 6000 Blackwell Max-Q. Other CUDA configurations probe
-automatically. Use `--probe-batch-sizes` to recalibrate or `--batch-size` to
-supply one batch size for every stage. The probe runs two optimizer updates
-per candidate and restores the stage's initial weights before training starts.
+The runner checks CUDA batch sizes at each stage. On the RTX PRO 6000 Blackwell
+Max-Q with the default architecture and 90 GiB budget, the batch-size ceilings
+are 224 for `model1` and `local_field`, and 160 for the end-to-end `model3` arms
+and `model4`. With the physics loss enabled, these batches peaked at 72.64 GiB,
+72.07 GiB, and 76.09 GiB of PyTorch reserved memory, respectively. Probes cover
+full and partial training batches, validation, and the return to training. They
+target at most 81 GiB reserved under the 89 GiB PyTorch allocator cap. CUDA
+validation uses batches of at most 64. Use `--probe-batch-sizes` to search
+without the preset ceiling or `--batch-size` to supply an initial batch size
+for every stage.
+
+If CUDA runs out of memory during training, the runner restarts the affected
+stage with its initial weights and half the batch size, down to one.

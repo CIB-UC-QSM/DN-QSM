@@ -32,6 +32,13 @@ LEGACY_MANIFEST_VERSION = 1
 MANIFEST_VERSION = 2
 DIRECT = "model1"
 DNQSM_ARM = "model4"
+STAGES = (
+    DIRECT,
+    "local_field",
+    *(f"model3_{inverse}" for inverse in INVERSES),
+    DNQSM_ARM,
+)
+CUDA_VALIDATION_BATCH_LIMIT = 64
 
 
 @dataclass(frozen=True)
@@ -132,22 +139,62 @@ def _update(model, optimizer, batch, target_name, dipole, device, config):
     return scalars
 
 
-def _probe_batch_size(model, target, dataset, stage, device, config):
-    """Find the largest batch that fits the configured CUDA allocator budget."""
-    data = make_patch_dataloader(dataset, seed=config.seed).dataset
-    dipole = data.dipole(device)
-    initial = {
+def _snapshot(model):
+    return {
         name: tensor.detach().to("cpu", copy=True)
         for name, tensor in model.state_dict().items()
     }
-    model.train()
+
+
+def _validation_loader(dataset, config, device):
+    batch_size = config.batch_size
+    if device.type == "cuda":
+        batch_size = min(batch_size, CUDA_VALIDATION_BATCH_LIMIT)
+    return make_patch_dataloader(
+        dataset,
+        "validation",
+        batch_size=batch_size,
+        num_workers=config.workers,
+        seed=config.seed,
+        fixed_backgrounds=True,
+    )
+
+
+def _boundary_batches(loader):
+    iterator = iter(loader)
+    batch = next(iterator)
+    yield batch
+    tail = len(loader.dataset) % loader.batch_size
+    if len(loader) > 1 and tail:
+        # The leading dimensions match the last partial batch of an epoch.
+        yield {name: value[:tail] for name, value in batch.items()}
+
+
+def _probe_batch_size(
+    model, target, dataset, stage, device, config, budget, ceiling=None
+):
+    """Probe the training and validation shapes with room below the allocator cap."""
+    data = make_patch_dataloader(dataset, seed=config.seed).dataset
+    dipole = data.dipole(device)
+    initial = _snapshot(model)
+    allocator_cap = budget - 1
+    peak_limit = allocator_cap - min(8, 0.1 * allocator_cap)
 
     def trial(size):
         loader = make_patch_dataloader(dataset, batch_size=size, seed=config.seed)
-        batch = next(iter(loader))
+        batches = list(_boundary_batches(loader))
         optimizer = _optimizer(model, config)
-        for _ in range(2):
+        model.train()
+        for batch in batches:
             _update(model, optimizer, batch, target, dipole, device, config)
+        validation = _validation_loader(
+            dataset, replace(config, batch_size=size, workers=0), device
+        )
+        _validate(
+            model, _boundary_batches(validation), target, dipole, device, config.bf16
+        )
+        model.train()
+        _update(model, optimizer, batches[0], target, dipole, device, config)
         torch.cuda.synchronize(device)
         return torch.cuda.max_memory_reserved(device) / 1024**3
 
@@ -163,21 +210,23 @@ def _probe_batch_size(model, target, dataset, stage, device, config):
             model.load_state_dict(initial)
             torch.cuda.empty_cache()
         result = "OOM" if peak is None else f"{peak:.2f} GiB reserved"
-        print(f"{stage} batch probe {size}: {result}", flush=True)
-        return peak
+        print(
+            f"{stage} batch probe {size}: {result} (target at most {peak_limit:.2f} GiB)",
+            flush=True,
+        )
+        return peak if peak is not None and peak <= peak_limit else None
 
+    maximum = min(len(data), ceiling) if ceiling is not None else len(data)
     best, peak = 0, None
-    candidate = 1
+    candidate = maximum if ceiling is not None else 1
     while True:
         result = measure(candidate)
         if result is None:
             break
         best, peak = candidate, result
-        if best == len(data):
+        if best == maximum:
             return best, peak
-        candidate = min(2 * candidate, len(data))
-    if best == 0:
-        raise RuntimeError(f"{stage} cannot fit a batch of one")
+        candidate = min(2 * candidate, maximum)
     while candidate - best > 1:
         middle = (best + candidate) // 2
         result = measure(middle)
@@ -185,6 +234,10 @@ def _probe_batch_size(model, target, dataset, stage, device, config):
             candidate = middle
         else:
             best, peak = middle, result
+    if best == 0:
+        raise RuntimeError(
+            f"{stage} cannot fit a batch of one with the requested CUDA headroom"
+        )
     return best, peak
 
 
@@ -371,10 +424,10 @@ def train_comparison(
     if type(gd_iterations) is not int or gd_iterations < 1:
         raise ValueError("GD iterations must be a positive integer")
     device = require_device(device)
-    if probe_batch_sizes and (cuda_memory_gb is None or batch_sizes is not None):
-        raise ValueError(
-            "Batch probing requires a CUDA budget and no fixed batch sizes"
-        )
+    if probe_batch_sizes and cuda_memory_gb is None:
+        raise ValueError("Batch probing requires a CUDA budget")
+    if batch_sizes is not None and any(batch_sizes[stage] < 1 for stage in STAGES):
+        raise ValueError("Per-stage batch sizes must be positive")
     if cuda_memory_gb is not None:
         if device.type != "cuda":
             raise ValueError("CUDA batch tuning requires a CUDA device")
@@ -412,36 +465,20 @@ def train_comparison(
         **metadata,
         stages={},
     )
+    manifest["comparison_tag"] = comparison_tag or f"comparison-{uuid4().hex}"
     output.mkdir(parents=True, exist_ok=False)
-    comparison_tag = comparison_tag or f"comparison-{uuid4().hex}"
-    manifest["comparison_tag"] = comparison_tag
 
-    def fit(stage, model, target, *, legacy=False):
-        experiment = _start_experiment(output, stage, comparison_tag)
+    def fit_attempt(stage, model, target, stage_training, peak, attempt, legacy):
+        experiment = _start_experiment(output, stage, manifest["comparison_tag"])
         try:
-            peak = None
-            batch_size = training.batch_size
-            if batch_sizes is not None:
-                batch_size = batch_sizes[stage]
-            elif probe_batch_sizes:
-                batch_size, peak = _probe_batch_size(
-                    model, target, dataset, stage, device, training
-                )
-                print(f"{stage} selected batch size {batch_size}", flush=True)
-            stage_training = replace(training, batch_size=batch_size)
-            validation = make_patch_dataloader(
-                dataset,
-                "validation",
-                batch_size=batch_size,
-                num_workers=training.workers,
-                seed=training.seed,
-                fixed_backgrounds=True,
-            )
+            validation = _validation_loader(dataset, stage_training, device)
             experiment.log_parameters(
                 dict(
                     training=asdict(stage_training),
+                    validation_batch_size=validation.batch_size,
                     cuda_memory_budget_gib=cuda_memory_gb,
                     batch_probe_peak_reserved_gib=peak,
+                    attempt=attempt,
                     device=str(device),
                     inverses=inverses,
                     dataset_sha256=manifest["dataset"]["sha256"],
@@ -466,11 +503,64 @@ def train_comparison(
                 experiment,
             )
             record["comet_experiment_key"] = experiment.get_key()
-            record["batch_size"] = batch_size
-            if peak is not None:
-                record["batch_probe_peak_reserved_gib"] = peak
+            return record
+        except torch.cuda.OutOfMemoryError:
+            experiment.log_other("stage_status", "cuda_out_of_memory")
+            raise
         finally:
             experiment.end()
+
+    def fit(stage, model, target, *, legacy=False):
+        cuda = device.type == "cuda"
+        if cuda:
+            torch.cuda.empty_cache()
+        batch_size = (
+            batch_sizes[stage] if batch_sizes is not None else training.batch_size
+        )
+        peak = None
+        if probe_batch_sizes:
+            batch_size, peak = _probe_batch_size(
+                model,
+                target,
+                dataset,
+                stage,
+                device,
+                training,
+                cuda_memory_gb,
+                ceiling=batch_size if batch_sizes is not None else None,
+            )
+            print(f"{stage} selected batch size {batch_size}", flush=True)
+        initial = _snapshot(model) if cuda and batch_size > 1 else None
+        attempt = 1
+        while True:
+            try:
+                record = fit_attempt(
+                    stage,
+                    model,
+                    target,
+                    replace(training, batch_size=batch_size),
+                    peak,
+                    attempt,
+                    legacy,
+                )
+                break
+            except torch.cuda.OutOfMemoryError:
+                if initial is None or batch_size == 1:
+                    raise
+            # The failed traceback must release references to live tensors before cleanup.
+            batch_size = max(1, batch_size // 2)
+            peak = None
+            attempt += 1
+            model.zero_grad(set_to_none=True)
+            model.load_state_dict(initial)
+            torch.cuda.empty_cache()
+            print(
+                f"{stage} ran out of CUDA memory; restarting with batch size {batch_size}",
+                flush=True,
+            )
+        record["batch_size"] = batch_size
+        if peak is not None:
+            record["batch_probe_peak_reserved_gib"] = peak
         manifest["stages"][stage] = record
         write_json(output / "validation.json", manifest)
 

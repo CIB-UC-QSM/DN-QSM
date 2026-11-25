@@ -16,7 +16,7 @@ CUDA_MEMORY_GIB = 90
 CHECKPOINT_ROOT = Path("/Workspace/D/DN-QSM")
 MOUNTED_CHECKPOINT_ROOT = Path("/WorkSpace/D/DN-QSM")
 CALIBRATED_GPU = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
-CALIBRATED_BATCH_SIZES = {
+CALIBRATION_BATCH_CEILINGS = {
     "model1": 224,
     "local_field": 224,
     "model3_tkd": 160,
@@ -57,7 +57,9 @@ def main():
         "--batch-size", type=int, help="Override batch size for all stages"
     )
     batching.add_argument(
-        "--probe-batch-sizes", action="store_true", help="Recalibrate all CUDA stages"
+        "--probe-batch-sizes",
+        action="store_true",
+        help="Probe CUDA batches without preset ceilings",
     )
     parser.add_argument("--cuda-memory-gb", type=float, default=CUDA_MEMORY_GIB)
     args = parser.parse_args()
@@ -75,17 +77,15 @@ def main():
     if args.probe_batch_sizes and device.type != "cuda":
         parser.error("--probe-batch-sizes requires CUDA")
     batch_sizes = None
-    probe_batch_sizes = False
-    if device.type == "cuda" and args.batch_size is None:
+    probe_batch_sizes = device.type == "cuda" and args.batch_size is None
+    if probe_batch_sizes:
         if (
             not args.probe_batch_sizes
             and args.cuda_memory_gb == CUDA_MEMORY_GIB
             and tuple(args.features) == DEFAULT_FEATURES
             and torch.cuda.get_device_name(device) == CALIBRATED_GPU
         ):
-            batch_sizes = CALIBRATED_BATCH_SIZES
-        else:
-            probe_batch_sizes = True
+            batch_sizes = CALIBRATION_BATCH_CEILINGS
     torch.set_num_threads(args.threads)
     cases = load_cases(cosmos_simulation=args.cosmos_simulation, data_dir=args.data_dir)
     output.mkdir(parents=True, exist_ok=False)
@@ -110,7 +110,10 @@ def main():
         comparison_tag=tag,
     )
     experiment = _start_experiment(
-        output, "evaluation", tag, archive_dir=training_dir / "comet"
+        output,
+        "evaluation",
+        tag,
+        archive_dir=training_dir / "comet",
     )
     try:
         compare(
