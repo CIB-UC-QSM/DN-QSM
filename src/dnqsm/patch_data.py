@@ -23,7 +23,7 @@ def scale_positive(chi, scale):
 
 
 class QSMPatchDataset(Dataset):
-    """Randomize the stored background on every read, including validation."""
+    """Sample background and noise per read, or per patch with fixed backgrounds."""
 
     def __init__(self, root, split="train", *, seed=2026, fixed_backgrounds=False):
         if split not in ("train", "validation"):
@@ -87,6 +87,14 @@ class QSMPatchDataset(Dataset):
             option = (
                 hashlib.blake2b(key, digest_size=1).digest()[0] % BACKGROUND_OPTIONS
             )
+            noise_key = key + f":{variant_index}".encode()
+            noise_seed = int.from_bytes(
+                hashlib.blake2b(
+                    noise_key, digest_size=8, person=b"local-noise"
+                ).digest(),
+                "little",
+            )
+            rng = np.random.default_rng(noise_seed)
         else:
             worker = get_worker_info()
             seed = self.seed if worker is None else worker.seed
@@ -94,7 +102,8 @@ class QSMPatchDataset(Dataset):
             if self._rng is None or self._worker_seed != worker_key:
                 self._rng = np.random.default_rng(seed)
                 self._worker_seed = worker_key
-            option = int(self._rng.integers(BACKGROUND_OPTIONS))
+            rng = self._rng
+            option = int(rng.integers(BACKGROUND_OPTIONS))
 
         chi = arrays["chi"][patch_index].copy()
         scaled = variant_index in (1, 3)
@@ -104,13 +113,18 @@ class QSMPatchDataset(Dataset):
         if variant_index >= 2:
             chi *= -1
             local *= -1
+        mask = arrays["mask"][patch_index].copy()
         background = arrays["background"][patch_index, option].copy()
+        snr = rng.uniform(50, 200)
+        noise = rng.standard_normal(local.shape, dtype=np.float32)
+        noise *= np.abs(local).max() / snr
+        noise *= mask
         return {
             "chi": torch.from_numpy(chi[None]),
-            "mask": torch.from_numpy(arrays["mask"][patch_index][None].copy()),
+            "mask": torch.from_numpy(mask[None]),
             "local_field": torch.from_numpy(local[None]),
             "background_field": torch.from_numpy(background[None]),
-            "total_field": torch.from_numpy((local + background)[None]),
+            "total_field": torch.from_numpy((local + background + noise)[None]),
             "background_option": option,
             "source_id": record["source_id"],
             "variant": self.variants[variant_index],

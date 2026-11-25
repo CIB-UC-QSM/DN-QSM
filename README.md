@@ -138,10 +138,15 @@ dipole = loader.dataset.dipole()
 # prediction = model(batch["total_field"], batch["mask"], dipole)
 ```
 
-Every read selects one of the subject's four saved background fields with
-replacement, including reads from the `validation` split. The sample reports
+By default, every read selects one of the subject's four saved background fields
+with replacement, including reads from the `validation` split. The sample reports
 the selected `background_option`. Fields and susceptibility are in ppm,
 the mask is binary, and batched volumes have shape `[N, 1, 64, 64, 64]`.
+The loader draws a uniform SNR between 50 and 200 for each sample. It adds
+Gaussian noise inside the mask to `total_field`, with a standard deviation of
+`max(abs(local_field)) / SNR`. The `local_field` target is clean. With
+`fixed_backgrounds=True`, the noise and background selection are reproducible
+for each patch.
 The patch-grid dipole is for DN-QSM inference and analytic initialization.
 The stored local-field target includes contributions from susceptibility
 outside the crop on the full simulation grid.
